@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Object Benchmark Inspector</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #ddd; }
+
+  header { padding: 16px 24px; background: #1a1a1a; border-bottom: 1px solid #333; }
+  header h1 { font-size: 1.2rem; color: #fff; }
+  #stats { margin-top: 6px; font-size: 0.82rem; color: #888; }
+
+  #controls {
+    display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 24px;
+    background: #141414; border-bottom: 1px solid #2a2a2a; align-items: flex-end;
+  }
+  .ctrl-group { display: flex; flex-direction: column; gap: 4px; }
+  .ctrl-group label { font-size: 0.72rem; color: #777; text-transform: uppercase; letter-spacing: .04em; }
+  select, input[type=text] {
+    background: #222; color: #ddd; border: 1px solid #444;
+    padding: 5px 8px; border-radius: 4px; font-size: 0.84rem;
+  }
+  button { background: #444; color: #ccc; border: none; border-radius: 4px;
+    padding: 6px 14px; cursor: pointer; font-size: 0.84rem; align-self: flex-end; }
+  button:hover { background: #555; }
+
+  #grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px; padding: 18px 24px;
+  }
+  .card {
+    background: #1c1c1c; border: 1px solid #2a2a2a; border-radius: 8px;
+    overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
+    transition: border-color .15s;
+  }
+  .card:hover { border-color: #555; }
+  .card.settles   { border-top: 3px solid #2ecc71; }
+  .card.fails     { border-top: 3px solid #e74c3c; }
+  .card.mixed     { border-top: 3px solid #3498db; }
+  .card.has-error { border-top: 3px solid #f39c12; }
+
+  .gif-section-label {
+    font-size: 0.6rem; color: #555; text-transform: uppercase; letter-spacing: .05em;
+    padding: 3px 6px 1px; background: #161616;
+  }
+  .gif-row { display: flex; border-bottom: 1px solid #222; }
+  .gif-wrap { flex: 1; background: #111; position: relative; height: 160px; }
+  .gif-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .gif-label {
+    position: absolute; bottom: 4px; left: 4px; font-size: 0.65rem;
+    background: rgba(0,0,0,.65); color: #ccc; padding: 1px 5px; border-radius: 3px;
+  }
+  .gif-placeholder {
+    flex: 1; height: 160px; display: flex;
+    align-items: center; justify-content: center; font-size: 0.75rem; color: #555;
+  }
+
+  .meta { padding: 8px 10px; flex: 1; display: flex; flex-direction: column; gap: 5px; }
+  .asset-name { font-size: 0.78rem; color: #bbb; line-height: 1.3; word-break: break-all; }
+  .badges { display: flex; flex-wrap: wrap; gap: 4px; }
+  .badge { font-size: 0.68rem; padding: 2px 6px; border-radius: 3px; font-weight: 600; }
+  .badge.ok   { background: #1a3d27; color: #2ecc71; }
+  .badge.bad  { background: #3d1a1a; color: #e74c3c; }
+  .badge.warn { background: #3d2e1a; color: #f39c12; }
+  .badge.info { background: #1a2d3d; color: #3498db; }
+  .disp  { font-size: 0.75rem; color: #888; }
+  .error-msg { font-size: 0.7rem; color: #c0392b; word-break: break-all; }
+
+  #no-results { display: none; padding: 40px; text-align: center; color: #555; }
+  #loading    { padding: 40px; text-align: center; color: #666; }
+
+  /* ── Modal ── */
+  #modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.82); z-index: 1000;
+    align-items: center; justify-content: center;
+  }
+  #modal-overlay.open { display: flex; }
+  #modal {
+    background: #1a1a1a; border: 1px solid #333; border-radius: 10px;
+    width: min(96vw, 1000px); max-height: 92vh; overflow-y: auto;
+    display: flex; flex-direction: column;
+  }
+  #modal-header {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 14px 18px; border-bottom: 1px solid #2a2a2a; gap: 12px; position: sticky; top: 0;
+    background: #1a1a1a; z-index: 1;
+  }
+  #modal-title { font-size: 0.9rem; color: #ddd; word-break: break-all; line-height: 1.4; }
+  #modal-close {
+    flex-shrink: 0; background: #333; border: none; color: #ccc;
+    border-radius: 5px; padding: 4px 10px; cursor: pointer; font-size: 1rem;
+  }
+  #modal-close:hover { background: #555; }
+
+  .modal-section { border-bottom: 1px solid #2a2a2a; }
+  .modal-section-title {
+    font-size: 0.7rem; color: #666; text-transform: uppercase; letter-spacing: .06em;
+    padding: 10px 18px 6px; font-weight: 600;
+  }
+  .modal-gifs { display: flex; }
+  .modal-gif-col { flex: 1; display: flex; flex-direction: column; }
+  .modal-gif-col + .modal-gif-col { border-left: 1px solid #2a2a2a; }
+  .modal-gif-col h4 {
+    font-size: 0.72rem; color: #777; padding: 7px 14px;
+    text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #222;
+  }
+  .modal-gif-col img { width: 100%; display: block; }
+  .modal-gif-col .gif-placeholder {
+    aspect-ratio: 4/3; display: flex; align-items: center;
+    justify-content: center; color: #444; font-size: 0.8rem;
+  }
+  .metrics-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 1px; background: #2a2a2a;
+  }
+  .metric-cell { background: #1c1c1c; padding: 12px 16px; }
+  .metric-label { font-size: 0.67rem; color: #666; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+  .metric-value { font-size: 1rem; color: #ddd; font-weight: 600; }
+  .metric-value.ok   { color: #2ecc71; }
+  .metric-value.bad  { color: #e74c3c; }
+  .metric-value.warn { color: #f39c12; }
+  .modal-error {
+    padding: 12px 18px; background: #2a1a1a; font-size: 0.8rem;
+    color: #c0392b; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Object Benchmark Inspector</h1>
+  <div id="stats"></div>
+</header>
+
+<div id="controls">
+  <div class="ctrl-group">
+    <label>Search</label>
+    <input type="text" id="f-name" placeholder="asset name…" style="width:220px">
+  </div>
+  <div class="ctrl-group">
+    <label>Physics mode</label>
+    <select id="f-phys-mode">
+      <option value="">Both</option>
+      <option value="convex_hull">Convex hull</option>
+      <option value="vhacd">VHACD</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Physics settles</label>
+    <select id="f-settles">
+      <option value="">All</option>
+      <option value="true">Yes</option>
+      <option value="false">No</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Sinks</label>
+    <select id="f-sinks">
+      <option value="">All</option>
+      <option value="true">Yes</option>
+      <option value="false">No</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Flies away</label>
+    <select id="f-flies">
+      <option value="">All</option>
+      <option value="true">Yes</option>
+      <option value="false">No</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Grasp success</label>
+    <select id="f-grasp">
+      <option value="">All</option>
+      <option value="any">Any success</option>
+      <option value="perfect">Perfect (100%)</option>
+      <option value="zero">None (0%)</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Has error</label>
+    <select id="f-error">
+      <option value="">All</option>
+      <option value="yes">Yes</option>
+      <option value="no">No</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Sort by</label>
+    <select id="f-sort">
+      <option value="name">Asset name</option>
+      <option value="displacement">XZ Displacement (m)</option>
+      <option value="contacts">Contact points</option>
+    </select>
+  </div>
+  <div class="ctrl-group">
+    <label>Order</label>
+    <select id="f-dir">
+      <option value="asc">↑ Asc</option>
+      <option value="desc">↓ Desc</option>
+    </select>
+  </div>
+  <button onclick="resetFilters()">Reset</button>
+</div>
+
+<div id="loading">Loading results…</div>
+<div id="grid"></div>
+<div id="no-results">No assets match the current filters.</div>
+
+<!-- Modal -->
+<div id="modal-overlay" onclick="onOverlayClick(event)">
+  <div id="modal">
+    <div id="modal-header">
+      <div id="modal-title"></div>
+      <button id="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+// ── Data loading ─────────────────────────────────────────────────────────────
+
+let CARDS = [];
+
+async function loadData() {
+  let data;
+  try {
+    const res = await fetch('results.json');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (e) {
+    document.getElementById('loading').textContent =
+      `Failed to load results.json: ${e.message}`;
+    return;
+  }
+  document.getElementById('loading').style.display = 'none';
+
+  CARDS = buildCards(data.assets);
+  applyFilters();
+}
+
+function buildCards(assets) {
+  return Object.entries(assets).map(([asset_id, checks]) => {
+    const p = checks.physics || {};
+    const g = checks.graspability || {};
+
+    const physModes = Object.keys(p);
+    const physGifs  = {};
+    physModes.forEach(m => { physGifs[m] = p[m]?.gif ?? null; });
+
+    const graspModes = Object.keys(g);
+    const graspRef   = g[graspModes[0]] || {};
+    const graspGifs  = {};
+    graspModes.forEach(m => { graspGifs[m] = g[m]?.gif ?? null; });
+
+    return {
+      asset_id,
+      checks,
+      physics_modes: physModes,
+      physics_gifs:  physGifs,
+      grasp_modes:   graspModes,
+      grasp_gifs:    graspGifs,
+      // graspability filter fields (mode-independent for now)
+      grasp_success_rate: graspRef.grasp_success_rate ?? null,
+    };
+  });
+}
+
+// ── Mode helpers ─────────────────────────────────────────────────────────────
+
+function selectedPhysMode() {
+  return document.getElementById('f-phys-mode')?.value ?? '';
+}
+
+function physRef(card) {
+  const mode = selectedPhysMode();
+  const p = card.checks.physics || {};
+  if (mode) return p[mode] || p[Object.keys(p)[0]] || {};
+  // "Both" — return first available mode for metric display
+  return p[Object.keys(p)[0]] || {};
+}
+
+// Returns 'both' | 'none' | 'mixed' | null when no physics data
+function physSettlesState(card) {
+  const mode = selectedPhysMode();
+  const p = card.checks.physics || {};
+  if (mode) {
+    const ref = p[mode] || p[Object.keys(p)[0]] || {};
+    if (ref.physics_settles === true)  return 'both';
+    if (ref.physics_settles === false) return 'none';
+    return null;
+  }
+  // Both modes
+  const vals = Object.values(p).map(m => m.physics_settles);
+  if (!vals.length) return null;
+  const allTrue  = vals.every(v => v === true);
+  const allFalse = vals.every(v => v === false);
+  if (allTrue)  return 'both';
+  if (allFalse) return 'none';
+  return 'mixed';
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────────
+
+function badge(cls, text) {
+  return `<span class="badge ${cls}">${text}</span>`;
+}
+
+function physBadges(card) {
+  const state = physSettlesState(card);
+  const p = physRef(card);
+  const b = [];
+  if (state === 'both')  b.push(badge('ok',   'settles'));
+  if (state === 'none')  b.push(badge('bad',  'fails'));
+  if (state === 'mixed') b.push(badge('info',  'mixed'));
+  if (p.sinks_below_floor) b.push(badge('bad', 'sinks'));
+  if (p.flies_away)        b.push(badge('bad', 'flies'));
+  return b.join('');
+}
+
+function encodePath(path) {
+  return path.split('/').map(s => encodeURIComponent(s)).join('/');
+}
+
+function gifThumb(path, label) {
+  if (!path) return `<div class="gif-placeholder">no image</div>`;
+  return `<div class="gif-wrap">
+    <img src="${encodePath(path)}">
+    <span class="gif-label">${label}</span>
+  </div>`;
+}
+
+function graspBadge(card) {
+  const r = card.grasp_success_rate;
+  if (r === null) return '';
+  const pct = Math.round(r * 100);
+  const cls = r >= 0.8 ? 'ok' : r >= 0.4 ? 'warn' : 'bad';
+  return `<span class="badge ${cls}">grasp ${pct}%</span>`;
+}
+
+function gifRowFor(modes, gifs, label) {
+  const withGif = modes.filter(m => gifs[m]);
+  if (!withGif.length) return '';
+  const cols = withGif.map(m => gifThumb(gifs[m], modeLabel(m))).join('');
+  return `<div class="gif-section-label">${label}</div><div class="gif-row">${cols}</div>`;
+}
+
+function renderCard(card) {
+  const p       = physRef(card);
+  const hasErr  = !!(p.error ?? (card.checks.graspability && Object.values(card.checks.graspability)[0]?.error));
+  const state   = physSettlesState(card);
+  const cls     = hasErr ? 'has-error' : state === 'both' ? 'settles' : state === 'mixed' ? 'mixed' : 'fails';
+
+  const disp = p.displacement_m !== null && p.displacement_m !== undefined
+    ? `<div class="disp">xz_disp: ${p.displacement_m} m &nbsp;|&nbsp; final_y: ${p.final_y_offset_m ?? '–'} m &nbsp;|&nbsp; min_y: ${p.min_y_offset_m ?? '–'} m</div>`
+    : '';
+  const err = p.error
+    ? `<div class="error-msg">⚠ ${p.error}</div>` : '';
+
+  // Show physics GIFs; add grasp GIFs if available
+  const physRow  = gifRowFor(card.physics_modes, card.physics_gifs, 'Physics');
+  const graspRow = gifRowFor(card.grasp_modes,   card.grasp_gifs,   'Grasp');
+  const gifArea  = physRow || graspRow
+    ? (physRow + graspRow)
+    : `<div class="gif-row"><div class="gif-placeholder" style="flex:1">no image</div></div>`;
+
+  return `<div class="card ${cls}">
+    ${gifArea}
+    <div class="meta">
+      <div class="asset-name">${card.asset_id}</div>
+      <div class="badges">${physBadges(card)}${graspBadge(card)}</div>
+      ${disp}${err}
+    </div>
+  </div>`;
+}
+
+// ── Filters ──────────────────────────────────────────────────────────────────
+
+function val(id) { return document.getElementById(id).value; }
+
+function applyFilters() {
+  const name   = val('f-name').trim().toLowerCase();
+  const settles= val('f-settles');
+  const sinks  = val('f-sinks');
+  const flies  = val('f-flies');
+  const graspF = val('f-grasp');
+  const errF   = val('f-error');
+  const sortBy = val('f-sort');
+  const sortDir= val('f-dir');
+
+  let filtered = CARDS.filter(c => {
+    const p = physRef(c);
+    if (name    && !c.asset_id.toLowerCase().includes(name))       return false;
+    if (settles === 'true'  && physSettlesState(c) !== 'both')   return false;
+    if (settles === 'false' && physSettlesState(c) !== 'none')   return false;
+    if (sinks   && String(p.sinks_below_floor) !== sinks)          return false;
+    if (flies   && String(p.flies_away)        !== flies)          return false;
+    if (graspF === 'any'     && !(c.grasp_success_rate > 0))       return false;
+    if (graspF === 'perfect' && c.grasp_success_rate !== 1.0)      return false;
+    if (graspF === 'zero'    && c.grasp_success_rate !== 0.0)      return false;
+    if (errF === 'yes' && !p.error)  return false;
+    if (errF === 'no'  &&  p.error)  return false;
+    return true;
+  });
+
+  const asc = sortDir === 'asc';
+  filtered.sort((a, b) => {
+    const INF = asc ? Infinity : -Infinity;
+    if (sortBy === 'name')
+      return asc ? a.asset_id.localeCompare(b.asset_id) : b.asset_id.localeCompare(a.asset_id);
+    if (sortBy === 'displacement') {
+      const va = physRef(a).displacement_m ?? INF, vb = physRef(b).displacement_m ?? INF;
+      return asc ? va - vb : vb - va;
+    }
+    if (sortBy === 'contacts') {
+      const va = physRef(a).contact_points_at_rest ?? INF, vb = physRef(b).contact_points_at_rest ?? INF;
+      return asc ? va - vb : vb - va;
+    }
+    return 0;
+  });
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = filtered.map(renderCard).join('');
+  document.getElementById('no-results').style.display =
+    filtered.length === 0 ? 'block' : 'none';
+
+  // Wire click → modal
+  grid.querySelectorAll('.card').forEach((el, i) =>
+    el.addEventListener('click', () => openModal(filtered[i]))
+  );
+
+  // Stats
+  const total   = CARDS.length;
+  const settled = CARDS.filter(c => physSettlesState(c) === 'both').length;
+  const mixed   = CARDS.filter(c => physSettlesState(c) === 'mixed').length;
+  const errors  = CARDS.filter(c => !!physRef(c).error).length;
+  const modeLabel = selectedPhysMode() ? selectedPhysMode().replace('_', ' ') : 'both modes';
+  const mixedStr  = selectedPhysMode() ? '' : ` — mixed: ${mixed}`;
+  document.getElementById('stats').textContent =
+    `${total} assets [${modeLabel}] — settled: ${settled} (${(100*settled/total).toFixed(1)}%)${mixedStr} — errors: ${errors} — showing: ${filtered.length}`;
+}
+
+function resetFilters() {
+  ['f-name','f-settles','f-sinks','f-flies','f-grasp','f-error'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  applyFilters();
+}
+
+document.querySelectorAll('#controls select, #controls input')
+  .forEach(el => el.addEventListener('input', applyFilters));
+
+// ── Modal ────────────────────────────────────────────────────────────────────
+
+function metricCell(label, value, cls) {
+  return `<div class="metric-cell">
+    <div class="metric-label">${label}</div>
+    <div class="metric-value ${cls ?? ''}">${value ?? '–'}</div>
+  </div>`;
+}
+
+function boolCell(label, val, trueClass, falseClass) {
+  if (val === null || val === undefined) return metricCell(label, '–', '');
+  return metricCell(label, val ? 'Yes' : 'No', val ? trueClass : falseClass);
+}
+
+function renderPhysicsSection(modes) {
+  const sections = Object.entries(modes).map(([mode, m]) => {
+    const disp   = m.displacement_m;
+    const minY   = m.min_y_offset_m;
+    const dispCls = disp > 0.5 ? 'bad' : disp > 0.1 ? 'warn' : 'ok';
+    const minYCls = minY < -0.05 ? 'bad' : minY < 0 ? 'warn' : 'ok';
+    const finalY    = m.final_y_offset_m;
+    const finalYCls = finalY < -0.02 ? 'bad' : finalY < 0 ? 'warn' : 'ok';
+    const metrics = [
+      boolCell('Settles',              m.physics_settles,   'ok',  'bad'),
+      metricCell('XZ Displacement (m)', disp   !== null ? disp.toFixed(4)   : null, dispCls),
+      boolCell('Flies away',           m.flies_away,        'bad', 'ok'),
+      metricCell('Final Y offset (m)', finalY !== null ? finalY.toFixed(4) : null, finalYCls),
+      boolCell('Sinks permanently',    m.sinks_permanently, 'bad', 'ok'),
+      metricCell('Min Y offset (m)',   minY   !== null ? minY.toFixed(4)   : null, minYCls),
+      boolCell('Sinks below floor',    m.sinks_below_floor, 'bad', 'ok'),
+    ].join('');
+    const err = m.error ? `<div class="modal-error">⚠ ${m.error}</div>` : '';
+    const label = modeLabel(mode);
+    return `
+      <div class="modal-section-title">Physics — ${label}</div>
+      <div class="metrics-grid">${metrics}</div>
+      ${err}`;
+  });
+  return sections.join('');
+}
+
+const MODE_LABELS = {
+  convex_hull: 'Convex hull (1 part)',
+  vhacd:       'CoACD / VHACD (N parts)',
+  with:        'With collision mesh',
+  without:     'Without collision mesh',
+};
+
+function modeLabel(mode) {
+  return MODE_LABELS[mode] || mode.replace(/_/g, ' ');
+}
+
+function renderGifsSection(title, modes) {
+  const cols = Object.entries(modes).map(([mode, m]) => {
+    const img = m?.gif
+      ? `<img src="${encodePath(m.gif)}">`
+      : `<div class="gif-placeholder">no image</div>`;
+    return `<div class="modal-gif-col"><h4>${modeLabel(mode)}</h4>${img}</div>`;
+  }).join('');
+  return `<div class="modal-section">
+    <div class="modal-section-title">${title}</div>
+    <div class="modal-gifs">${cols}</div>
+  </div>`;
+}
+
+function renderGraspSection(modes) {
+  const sections = Object.entries(modes).map(([mode, m]) => {
+    const rate    = m.grasp_success_rate;
+    const rateCls = rate >= 0.8 ? 'ok' : rate >= 0.4 ? 'warn' : 'bad';
+    const metrics = [
+      metricCell('Success rate', rate !== null ? (rate * 100).toFixed(1) + '%' : null, rateCls),
+      metricCell('Successes', m.grasp_successes !== null ? `${m.grasp_successes} / ${m.grasp_trials}` : null, rateCls),
+      metricCell('Grasp width (m)', m.mean_grasp_width_m !== null ? m.mean_grasp_width_m.toFixed(4) : null,
+        m.mean_grasp_width_m > 0.08 ? 'bad' : 'ok'),
+    ].join('');
+    const err = m.error ? `<div class="modal-error">⚠ ${m.error}</div>` : '';
+    return `
+      <div class="modal-section-title">Graspability — ${modeLabel(mode)}</div>
+      <div class="metrics-grid">${metrics}</div>
+      ${err}`;
+  });
+  return sections.join('');
+}
+
+function openModal(card) {
+  document.getElementById('modal-title').textContent = card.asset_id;
+
+  let body = '';
+
+  if (card.checks.physics)      body += renderGifsSection('Physics GIFs',     card.checks.physics);
+  if (card.checks.graspability) body += renderGifsSection('Graspability GIFs', card.checks.graspability);
+
+  if (card.checks.physics)
+    body += `<div class="modal-section">${renderPhysicsSection(card.checks.physics)}</div>`;
+  if (card.checks.graspability)
+    body += `<div class="modal-section">${renderGraspSection(card.checks.graspability)}</div>`;
+
+  document.getElementById('modal-body').innerHTML = body;
+  document.getElementById('modal-overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+function onOverlayClick(e) {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+loadData();
+</script>
+</body>
+</html>
