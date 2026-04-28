@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 
 os.environ["MAGNUM_LOG"] = "quiet"
+os.environ["MAGNUM_GPU_VALIDATION"] = "off"
 os.environ["HABITAT_SIM_LOG"] = "quiet"
 os.environ["GLOG_minloglevel"] = "5"
 
@@ -15,7 +16,6 @@ import pandas as pd
 from tqdm import tqdm
 
 from habitat_object_benchmark.checks import physics_check
-from habitat_object_benchmark.scripts.build_results_json import build as build_results_json
 from habitat_object_benchmark.utils.sim_factory import make_sim
 
 FIELDNAMES = [
@@ -28,6 +28,7 @@ FIELDNAMES = [
     "sinks_permanently",
     "min_y_offset_m",
     "sinks_below_floor",
+    "settle_time_s",
     "contact_points_at_rest",
     "error",
 ]
@@ -36,17 +37,28 @@ FIELDNAMES = [
 _sim = None
 _modes = None
 _images_dirs = None
+_config_dir = None
+_timeout_s = None
 
 
-def _worker_init(config_dir, scene_path, save_images, modes, out_dir):
+def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s):
     os.environ["MAGNUM_LOG"] = "quiet"
+    os.environ["MAGNUM_GPU_VALIDATION"] = "off"
     os.environ["HABITAT_SIM_LOG"] = "quiet"
     os.environ["GLOG_minloglevel"] = "5"
+    # Redirect stderr to suppress C++ warnings (MeshTools, Magnum) from workers
+    import sys
+    devnull = open(os.devnull, "w")
+    sys.stderr = devnull
+    os.dup2(devnull.fileno(), 2)
 
-    global _sim, _modes, _images_dirs
+    global _sim, _modes, _images_dirs, _config_dir, _timeout_s
     _modes = modes
+    _config_dir = config_dir
+    _timeout_s = timeout_s
     _sim = make_sim(scene_path=scene_path, with_renderer=save_images, simple_floor=True)
-    _sim.get_object_template_manager().load_configs(config_dir)
+    # Do NOT bulk-load all configs here — load each template lazily in _process_asset
+    # to avoid stalling workers on large GLB datasets (e.g. Objaverse).
 
     _images_dirs = {}
     for mode in modes:
@@ -60,6 +72,8 @@ def _worker_init(config_dir, scene_path, save_images, modes, out_dir):
 
 def _process_asset(asset_id):
     otm = _sim.get_object_template_manager()
+    cfg_path = str(Path(_config_dir) / f"{asset_id}.object_config.json")
+    otm.load_configs(cfg_path)
     handles = otm.get_template_handles(asset_id)
     rows = []
     if not handles:
@@ -80,18 +94,75 @@ def _process_asset(asset_id):
     return rows
 
 
-def _run_batch(asset_ids_batch, init_args, workers, csv_file, writer):
-    """Process one batch inside a fresh Pool, then destroy it to free all memory."""
+def _error_rows(asset_id, modes, msg):
+    return [{"asset_id": asset_id, "collision_mode": m,
+             "physics_settles": False, "displacement_m": None,
+             "flies_away": None, "final_y_offset_m": None,
+             "sinks_permanently": None, "min_y_offset_m": None,
+             "sinks_below_floor": None, "settle_time_s": None,
+             "contact_points_at_rest": None, "error": msg} for m in modes]
+
+
+def _run_batch(asset_ids_batch, init_args, workers, csv_file, writer, progress):
+    """Process one batch with per-asset timeout via apply_async.
+
+    Submits exactly `workers` tasks at a time so every submitted task is
+    actively running when get(timeout=...) is called — avoiding false timeouts
+    on queued-but-not-started tasks.
+    """
+    timeout_s = init_args[5]  # passed through init_args
+    modes     = init_args[3]
     ctx = mp.get_context("spawn")
-    with ctx.Pool(
-        processes=workers,
-        initializer=_worker_init,
-        initargs=init_args,
-    ) as pool:
-        for rows in pool.imap_unordered(_process_asset, asset_ids_batch):
+    pool = ctx.Pool(processes=workers, initializer=_worker_init, initargs=init_args)
+    try:
+        pending = []   # list of (future, asset_id)
+        queue   = list(asset_ids_batch)
+
+        def _drain_one(future, asset_id):
+            try:
+                rows = future.get(timeout=timeout_s)
+            except mp.TimeoutError:
+                tqdm.write(f"  TIMEOUT ({timeout_s}s): {asset_id}")
+                pool.terminate()
+                pool.join()
+                raise _PoolDead()
+            except Exception as e:
+                rows = _error_rows(asset_id, modes, str(e))
             for row in rows:
                 writer.writerow(row)
             csv_file.flush()
+            progress.update(1)
+
+        # Seed initial tasks
+        for aid in queue[:workers]:
+            pending.append((pool.apply_async(_process_asset, (aid,)), aid))
+        remaining = queue[workers:]
+
+        for aid in remaining:
+            future, done_id = pending.pop(0)
+            _drain_one(future, done_id)
+            pending.append((pool.apply_async(_process_asset, (aid,)), aid))
+
+        for future, aid in pending:
+            _drain_one(future, aid)
+
+    except _PoolDead:
+        pass  # pool already terminated; remaining assets retried on next --resume
+    except Exception as e:
+        tqdm.write(f"  _run_batch unexpected error: {e}")
+    finally:
+        try:
+            pool.terminate()
+        except Exception:
+            pass
+        try:
+            pool.join(timeout=10)
+        except Exception:
+            pass
+
+
+class _PoolDead(Exception):
+    pass
 
 
 def main():
@@ -106,6 +177,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=100,
                         help="Assets per Pool batch — pool is destroyed and recreated between "
                              "batches to release habitat-sim mesh cache memory (default: 100)")
+    parser.add_argument("--timeout", type=int, default=20,
+                        help="Per-asset timeout in seconds before marking as error (default: 20)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip assets already present in the output CSV")
     args = parser.parse_args()
@@ -143,7 +216,7 @@ def main():
 
     init_args = (
         str(args.config_dir), args.scene, args.save_images,
-        modes, str(args.out_dir),
+        modes, str(args.out_dir), args.timeout,
     )
 
     open_mode = "a" if args.resume else "w"
@@ -157,8 +230,11 @@ def main():
         overall = tqdm(total=len(asset_ids), desc="assets")
         for batch_idx, batch in enumerate(batches):
             tqdm.write(f"Batch {batch_idx + 1}/{len(batches)} ({len(batch)} assets) — spawning fresh pool...")
-            _run_batch(batch, init_args, args.workers, f, writer)
-            overall.update(len(batch))
+            try:
+                _run_batch(batch, init_args, args.workers, f, writer, overall)
+            except Exception as e:
+                tqdm.write(f"  Batch {batch_idx + 1} crashed: {e} — continuing with next batch")
+                f.flush()
         overall.close()
 
     # Summary
@@ -179,10 +255,6 @@ def main():
         print(f"  errors:               {m['error'].notna().sum()}")
 
     print(f"\nFull results: {csv_path}")
-
-    # Rebuild results.json so the inspector reflects the latest run
-    results_root = args.out_dir.parent
-    build_results_json(results_root, results_root / "results.json")
 
 
 if __name__ == "__main__":

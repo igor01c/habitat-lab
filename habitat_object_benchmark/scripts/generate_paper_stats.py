@@ -77,6 +77,7 @@ METRIC_ARROW = {
     "XZ disp":             " ↓",
     "final Y offset":      " ↑",
     "min Y offset":        " ↑",
+    "settle time":         " ↓",
     # graspability pass-rate columns
     "Any success":         " ↑",
     "Perfect (100%)":      " ↑",
@@ -96,6 +97,7 @@ METRIC_HIGHER_BETTER = {
     "XZ disp":             False,
     "final Y offset":      True,
     "min Y offset":        True,
+    "settle time":         False,
     "Any success":         True,
     "Perfect (100%)":      True,
     "None (0%)":           False,
@@ -183,6 +185,7 @@ def _pct_plain(n, total):
 # ── Physics stats ─────────────────────────────────────────────────────────────
 
 def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_sections: list):
+    out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
     for col in ["physics_settles", "flies_away", "sinks_permanently", "sinks_below_floor"]:
         df[col] = df[col].map({"True": True, "False": False, True: True, False: False})
@@ -226,6 +229,7 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
         ("displacement_m",   "XZ disp (m)"),
         ("final_y_offset_m", "final Y offset (m)"),
         ("min_y_offset_m",   "min Y offset (m)"),
+        ("settle_time_s",    "settle time (s)"),
     ]
     dist_rows = []
     dist_rows_plain = []  # interleaved by metric for per-group bolding
@@ -298,20 +302,22 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
                 "⚠️" if row["sinks_permanently"] else "ok",
                 f"{row['min_y_offset_m']:.4f}" if pd.notna(row["min_y_offset_m"]) else "–",
                 "⚠️" if row["sinks_below_floor"] else "ok",
+                f"{row['settle_time_s']:.3f}" if "settle_time_s" in row and pd.notna(row["settle_time_s"]) else "–",
                 row["error"] if pd.notna(row["error"]) else "",
             ])
         md_sections.append(_md_table(
-            ["Asset", "Settles", "XZ disp (m)", "Flies away", "Final Y offset (m)", "Sinks permanently", "Min Y offset (m)", "Sinks (trajectory)", "Error"],
+            ["Asset", "Settles", "XZ disp (m)", "Flies away", "Final Y offset (m)", "Sinks permanently", "Min Y offset (m)", "Sinks (trajectory)", "Settle time (s)", "Error"],
             per_asset_rows,
         ))
         md_sections.append("")
 
     # ── Figures ───────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     metrics = [
-        ("displacement_m",   "XZ Displacement (m)",  0.5),
+        ("displacement_m",   "XZ Displacement (m)",  1.5),
         ("final_y_offset_m", "Final Y Offset (m)",   None),
         ("min_y_offset_m",   "Min Y Offset (m)",     None),
+        ("settle_time_s",    "Settle Time (s)",       None),
     ]
     colors = {"convex_hull": "#3498db", "vhacd": "#e67e22"}
     for ax, (col, xlabel, vline) in zip(axes, metrics):
@@ -332,6 +338,7 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
 # ── Graspability stats ────────────────────────────────────────────────────────
 
 def grasp_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_sections: list):
+    out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
     modes = df["collision_mode"].unique().tolist()
     total = len(df[df["collision_mode"] == modes[0]])
@@ -472,41 +479,136 @@ def grasp_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_sections:
     plt.close(fig)
 
 
+# ── Comparison table (multi-dataset) ─────────────────────────────────────────
+
+def _comparison_section(datasets: dict, check: str, metrics: list, md_sections: list):
+    """Build a cross-dataset comparison table for one check type.
+
+    datasets: { name: results_dir }
+    metrics:  [(csv_col, label, fmt, higher_better)]
+    """
+    # Collect per-dataset, per-mode stats
+    rows_by_metric = {label: [] for _, label, _, _ in metrics}
+    dataset_mode_cols = []  # column headers: "name (mode)"
+
+    for ds_name, results_dir in datasets.items():
+        csv_path = results_dir / check / f"{check}_results.csv"
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        for col in ["physics_settles", "flies_away", "sinks_permanently", "sinks_below_floor"]:
+            if col in df.columns:
+                df[col] = df[col].map({"True": True, "False": False, True: True, False: False})
+        modes = df["collision_mode"].unique().tolist()
+        for mode in modes:
+            col_label = f"{ds_name} ({mode})"
+            dataset_mode_cols.append(col_label)
+            m = df[df["collision_mode"] == mode]
+            for csv_col, label, fmt, _ in metrics:
+                if csv_col in df.columns:
+                    s = m[csv_col]
+                    if s.dtype == bool or set(s.dropna().unique()).issubset({True, False}):
+                        val = f"{s.sum()} ({100*s.mean():.1f}%)"
+                    else:
+                        val = f"{s.mean():{fmt}}"
+                else:
+                    val = "–"
+                rows_by_metric[label].append(val)
+
+    if not dataset_mode_cols:
+        return
+
+    headers = ["Metric"] + dataset_mode_cols
+    rows = []
+    for _, label, _, hb in metrics:
+        row_vals = rows_by_metric[label]
+        # Bold winner
+        nums = [_extract_num(v) for v in row_vals]
+        valid = [(i, v) for i, v in enumerate(nums) if v is not None]
+        best_i = None
+        if len(valid) >= 2:
+            best_i = max(valid, key=lambda x: x[1] if hb else -x[1])[0]
+            best_val = nums[best_i]
+            if sum(1 for _, v in valid if v == best_val) > 1:
+                best_i = None  # tie
+        cells = []
+        for i, v in enumerate(row_vals):
+            cells.append(f"**{v}**" if i == best_i else v)
+        rows.append([label + _arrow(label)] + cells)
+
+    md_sections.append(f"\n## {check.title()} — Cross-dataset Comparison\n")
+    md_sections.append(_md_table(headers, rows))
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", required=True, type=Path)
-    parser.add_argument("--out-dir",     required=True, type=Path)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--results-dir", type=Path,
+                       help="Single dataset results dir")
+    group.add_argument("--dataset", metavar="NAME=PATH", action="append", dest="datasets",
+                       help="Multi-dataset: repeatable NAME=path/to/results pairs")
+    parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve dataset dict
+    if args.results_dir:
+        datasets = {args.results_dir.parent.name: args.results_dir}
+    else:
+        datasets = {}
+        for entry in args.datasets:
+            if "=" not in entry:
+                parser.error(f"--dataset must be NAME=PATH, got: {entry!r}")
+            name, path = entry.split("=", 1)
+            datasets[name] = Path(path)
+
     summary_lines = []
     md_sections   = ["# Benchmark Results\n"]
 
-    physics_csv = args.results_dir / "physics" / "physics_results.csv"
-    if physics_csv.exists():
-        print(f"Processing physics: {physics_csv}")
-        physics_stats(physics_csv, args.out_dir, summary_lines, md_sections)
-    else:
-        print(f"  (no physics CSV at {physics_csv})")
+    # Per-dataset sections
+    for ds_name, results_dir in datasets.items():
+        md_sections.append(f"\n---\n# Dataset: {ds_name}\n")
+        summary_lines.append(f"\n{'='*40}\nDataset: {ds_name}\n{'='*40}")
 
-    grasp_csv = args.results_dir / "graspability" / "graspability_results.csv"
-    if grasp_csv.exists():
-        print(f"Processing graspability: {grasp_csv}")
-        grasp_stats(grasp_csv, args.out_dir, summary_lines, md_sections)
-    else:
-        print(f"  (no graspability CSV at {grasp_csv})")
+        physics_csv = results_dir / "physics" / "physics_results.csv"
+        if physics_csv.exists():
+            print(f"[{ds_name}] Processing physics...")
+            physics_stats(physics_csv, args.out_dir / ds_name, summary_lines, md_sections)
+        else:
+            print(f"[{ds_name}] no physics CSV")
+
+        grasp_csv = results_dir / "graspability" / "graspability_results.csv"
+        if grasp_csv.exists():
+            print(f"[{ds_name}] Processing graspability...")
+            grasp_stats(grasp_csv, args.out_dir / ds_name, summary_lines, md_sections)
+        else:
+            print(f"[{ds_name}] no graspability CSV")
+
+    # Cross-dataset comparison (only meaningful with 2+ datasets)
+    if len(datasets) > 1:
+        _comparison_section(datasets, "physics", [
+            ("physics_settles",  "Settles",            ".1%", True),
+            ("displacement_m",   "XZ disp (m)",        ".4f", False),
+            ("final_y_offset_m", "final Y offset (m)", ".4f", True),
+            ("min_y_offset_m",   "min Y offset (m)",   ".4f", True),
+            ("settle_time_s",    "settle time (s)",    ".3f", False),
+            ("flies_away",       "Flies away",         ".1%", False),
+            ("sinks_permanently","Sinks permanently",  ".1%", False),
+            ("sinks_below_floor","Sinks (trajectory)", ".1%", False),
+        ], md_sections)
+        _comparison_section(datasets, "graspability", [
+            ("grasp_success_rate", "success rate",  ".3f", True),
+            ("mean_grasp_width_m", "grasp width (m)",".4f", False),
+        ], md_sections)
 
     (args.out_dir / "summary.txt").write_text("\n".join(summary_lines))
     (args.out_dir / "results.md").write_text("\n".join(md_sections))
 
     print(f"\nOutputs written to {args.out_dir}/")
-    print("  pass_rates.tex")
-    print("  distributions.tex")
-    print("  physics_distributions.pdf")
-    print("  grasp_distribution.pdf")
+    print("  results.md, summary.txt, pass_rates.tex, distributions.tex, *.pdf")
     print("  summary.txt")
     print("  results.md")
 

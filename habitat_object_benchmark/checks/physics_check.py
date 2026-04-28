@@ -17,12 +17,13 @@ from habitat.sims.habitat_simulator.sim_utilities import snap_down
 
 FLOOR_Y = 0.0                 # top surface of the simple floor plane (matches sim_factory)
 SPAWN_HEIGHT = 0.2            # gap between object bottom (AABB min Y) and floor at spawn
-PHYSICS_STEPS = 120      # 2 seconds at 1/60 s per step
+PHYSICS_STEPS = 300      # 5 seconds at 1/60 s per step
 GIF_FRAMES = 20          # number of frames captured across the full simulation
 GIF_FPS = 10             # playback speed of the output GIF
-FLY_THRESHOLD        = 0.5    # displacement from snap position → flying
-FINAL_SINK_THRESHOLD = -0.10  # final_y_offset below this → permanent floor overlap
-MIN_SINK_THRESHOLD   = -0.15  # min_y_offset below this → severe trajectory penetration
+FLY_THRESHOLD        = 1.5    # XZ displacement → explosion/teleport (relaxed: rolling/tipping OK)
+FINAL_SINK_THRESHOLD = -0.10  # final_y_offset below this → permanent floor penetration (strict)
+MIN_SINK_THRESHOLD   = -0.15  # min_y_offset below this → severe trajectory penetration (strict)
+SETTLE_VEL_THRESHOLD = 0.01   # linear velocity (m/s) below which object is considered settled
 def _look_at_rotation(eye: np.ndarray, target: np.ndarray):
     """Returns a numpy quaternion that orients the agent from eye toward target."""
     import quaternion as qt
@@ -101,6 +102,7 @@ def run(sim: habitat_sim.Simulator, asset_handle: str, collision_mode: str = "co
         "sinks_permanently": None,
         "min_y_offset_m": None,
         "sinks_below_floor": None,
+        "settle_time_s": None,
         "contact_points_at_rest": None,
         "error": None,
     }
@@ -114,8 +116,7 @@ def run(sim: habitat_sim.Simulator, asset_handle: str, collision_mode: str = "co
         template = otm.get_template_by_handle(asset_handle)
 
         if collision_mode == "convex_hull":
-            # Use render mesh as collision → Bullet wraps it in 1 convex hull
-            template.collision_asset_handle = template.render_asset_handle
+            # Use the dedicated collision mesh from the object config (single convex hull).
             otm.register_template(template, asset_handle + "__convex_hull")
             use_handle = asset_handle + "__convex_hull"
 
@@ -182,14 +183,25 @@ def run(sim: habitat_sim.Simulator, asset_handle: str, collision_mode: str = "co
                 for i in range(GIF_FRAMES)
             )
 
-        # Run simulation, tracking minimum Y reached at any point in the trajectory.
+        # Run simulation, tracking minimum Y and settle time.
         min_y = float(obj.translation[1])
+        settle_step = None  # first step where velocity stays below threshold
 
         for step in range(PHYSICS_STEPS):
             sim.step_physics(1.0 / 60.0)
             y = float(obj.translation[1])
             if y < min_y:
                 min_y = y
+            if settle_step is None:
+                vel = obj.linear_velocity
+                speed = float(mn.Vector3(vel).length())
+                if speed < SETTLE_VEL_THRESHOLD:
+                    settle_step = step
+            elif obj.linear_velocity is not None:
+                vel = obj.linear_velocity
+                speed = float(mn.Vector3(vel).length())
+                if speed >= SETTLE_VEL_THRESHOLD:
+                    settle_step = None  # object moved again, reset
             if capturing and step in capture_at:
                 gif_frames.append(_capture_frame(sim))
 
@@ -204,15 +216,18 @@ def run(sim: habitat_sim.Simulator, asset_handle: str, collision_mode: str = "co
         obj_contacts     = [c for c in sim.get_physics_contact_points()
                             if obj.object_id in (c.object_id_a, c.object_id_b)]
 
-        result["displacement_m"]        = round(displacement, 4)
-        result["flies_away"]            = displacement > FLY_THRESHOLD
-        result["final_y_offset_m"]      = final_y_offset
-        result["sinks_permanently"]     = final_y_offset < FINAL_SINK_THRESHOLD
-        result["min_y_offset_m"]        = min_y_offset
-        result["sinks_below_floor"]     = min_y_offset < MIN_SINK_THRESHOLD
+        result["displacement_m"]         = round(displacement, 4)
+        result["flies_away"]             = displacement > FLY_THRESHOLD
+        result["final_y_offset_m"]       = final_y_offset
+        result["sinks_permanently"]      = final_y_offset < FINAL_SINK_THRESHOLD
+        result["min_y_offset_m"]         = min_y_offset
+        result["sinks_below_floor"]      = min_y_offset < MIN_SINK_THRESHOLD
+        result["settle_time_s"]          = round(settle_step / 60.0, 3) if settle_step is not None else None
         result["contact_points_at_rest"] = len(obj_contacts)
+        # Pass/fail: only floor penetration and explosion are hard failures.
+        # Rolling, tipping, and slow settling are allowed.
         result["physics_settles"] = (
-            displacement   <= FLY_THRESHOLD
+            not (displacement > FLY_THRESHOLD)
             and final_y_offset >= FINAL_SINK_THRESHOLD
             and min_y_offset   >= MIN_SINK_THRESHOLD
         )

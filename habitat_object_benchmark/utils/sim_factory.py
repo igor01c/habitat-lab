@@ -30,12 +30,15 @@ def make_sim(
     backend_cfg.create_renderer = with_renderer
 
     agent_cfg = habitat_sim.agent.AgentConfiguration()
+    agent_cfg.height = 0.0
 
     if with_renderer:
         sensor_spec = habitat_sim.CameraSensorSpec()
         sensor_spec.uuid = "color"
         sensor_spec.sensor_type = habitat_sim.SensorType.COLOR
-        sensor_spec.resolution = [480, 640]
+        sensor_spec.resolution = [720, 1280]
+        sensor_spec.hfov = mn.Deg(60.0)
+        sensor_spec.position = mn.Vector3(0, 0, 0)
         agent_cfg.sensor_specifications = [sensor_spec]
     else:
         agent_cfg.sensor_specifications = []
@@ -72,8 +75,8 @@ def _add_floor(sim: habitat_sim.Simulator) -> None:
     def _add_static_box(name, scale, translation):
         tmpl = otm.get_template_by_handle(cube_handle)
         tmpl.scale = scale
-        tmpl.shader_type = "flat"
-        tmpl.force_flat_shading = True
+        tmpl.shader_type = "pbr"
+        tmpl.force_flat_shading = False
         otm.register_template(tmpl, name)
         obj = rom.add_object_by_template_handle(name, light_setup_key=habitat_sim.gfx.NO_LIGHT_KEY)
         obj.translation = translation
