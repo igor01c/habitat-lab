@@ -68,16 +68,17 @@ def _latex_table(headers, rows, caption, label):
 
 # Arrow suffix for each metric column (appended to header label)
 METRIC_ARROW = {
-    # physics pass-rate columns (higher count = worse for failure metrics)
+    # physics pass-rate columns
     "Settles":             " ↑",
+    "Stable":              " ↑",
     "Flies away":          " ↓",
-    "Sinks permanently":   " ↓",
-    "Sinks (trajectory)":  " ↓",
+    "Floor penetration":   " ↓",
+    "Within 60s":          " ↑",
     # physics distribution metrics
     "XZ disp":             " ↓",
-    "final Y offset":      " ↑",
-    "min Y offset":        " ↑",
+    "penetration Y":       " ↑",
     "settle time":         " ↓",
+    "wall time":           " ↓",
     # graspability pass-rate columns
     "Any success":         " ↑",
     "Perfect (100%)":      " ↑",
@@ -91,13 +92,14 @@ METRIC_ARROW = {
 # For each metric, is a higher numeric value better?
 METRIC_HIGHER_BETTER = {
     "Settles":             True,
+    "Stable":              True,
     "Flies away":          False,
-    "Sinks permanently":   False,
-    "Sinks (trajectory)":  False,
+    "Floor penetration":   False,
+    "Within 60s":          True,
     "XZ disp":             False,
-    "final Y offset":      True,
-    "min Y offset":        True,
+    "penetration Y":       True,
     "settle time":         False,
+    "wall time":           False,
     "Any success":         True,
     "Perfect (100%)":      True,
     "None (0%)":           False,
@@ -187,8 +189,9 @@ def _pct_plain(n, total):
 def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_sections: list):
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
-    for col in ["physics_settles", "flies_away", "sinks_permanently", "sinks_below_floor"]:
-        df[col] = df[col].map({"True": True, "False": False, True: True, False: False})
+    for col in ["physics_settles", "physics_stable", "flies_away", "floor_penetration"]:
+        if col in df.columns:
+            df[col] = df[col].map({"True": True, "False": False, True: True, False: False})
 
     modes = df["collision_mode"].unique().tolist()
     total = len(df[df["collision_mode"] == modes[0]])
@@ -201,23 +204,27 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
     for mode in modes:
         m = df[df["collision_mode"] == mode]
         n = len(m)
+        wt = m["wall_time_s"].dropna() if "wall_time_s" in m.columns else pd.Series([], dtype=float)
+        within_60 = int((wt <= 60.0).sum())
         row = [
             mode.replace("_", "\\_"),
-            _pct(int(m["physics_settles"].sum()),    n),
-            _pct(int(m["flies_away"].sum()),         n),
-            _pct(int(m["sinks_permanently"].sum()),  n),
-            _pct(int(m["sinks_below_floor"].sum()),  n),
+            _pct(int(m["physics_settles"].eq(True).sum()), n),
+            _pct(int(m["physics_stable"].eq(True).sum()),  n),
+            _pct(int(m["flies_away"].eq(True).sum()),      n),
+            _pct(int(m["floor_penetration"].eq(True).sum()), n),
+            _pct(within_60, len(wt)) if len(wt) else "–",
         ]
         rate_rows.append(row)
         summary_lines.append(
-            f"  [{mode}] settles={int(m['physics_settles'].sum())}/{n} "
-            f"flies={int(m['flies_away'].sum())} "
-            f"sinks_perm={int(m['sinks_permanently'].sum())} "
-            f"sinks_traj={int(m['sinks_below_floor'].sum())}"
+            f"  [{mode}] settles={int(m['physics_settles'].eq(True).sum())}/{n} "
+            f"stable={int(m['physics_stable'].eq(True).sum())} "
+            f"flies={int(m['flies_away'].eq(True).sum())} "
+            f"floor_pen={int(m['floor_penetration'].eq(True).sum())} "
+            f"within_60s={within_60}/{len(wt)}"
         )
 
     rate_tex = _latex_table(
-        ["Mode", "Settles", "Flies away", "Sinks permanently", "Sinks (trajectory)"],
+        ["Mode", "Settles", "Stable", "Flies away", "Floor penetration", "Within 60s"],
         rate_rows,
         "Physics stability pass rates per collision mode.",
         "physics_pass_rates",
@@ -226,25 +233,23 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
 
     # ── Distribution table ────────────────────────────────────────────────────
     phys_metrics = [
-        ("displacement_m",   "XZ disp (m)"),
-        ("final_y_offset_m", "final Y offset (m)"),
-        ("min_y_offset_m",   "min Y offset (m)"),
-        ("settle_time_s",    "settle time (s)"),
+        ("displacement_m",  "XZ disp (m)"),
+        ("penetration_y_m", "penetration Y (m)"),
+        ("settle_time_s",   "settle time (s)"),
+        ("wall_time_s",     "wall time (s)"),
     ]
     dist_rows = []
-    dist_rows_plain = []  # interleaved by metric for per-group bolding
+    dist_rows_plain = []
     for mode in modes:
         m = df[df["collision_mode"] == mode]
         for col, short in phys_metrics:
-            label       = f"{mode.replace('_', chr(95))} {short}"
-            label_plain = f"{mode} {short}"
+            label = f"{mode.replace('_', chr(95))} {short}"
             dist_rows.append(_dist_row(m[col], label))
             s = m[col].dropna()
             summary_lines.append(
                 f"  [{mode}] {col}: mean={s.mean():.4f} std={s.std():.4f} "
                 f"median={s.median():.4f} P25={s.quantile(0.25):.4f} P75={s.quantile(0.75):.4f}"
             )
-    # Build plain rows interleaved by metric so group_size=len(modes) works correctly
     for col, short in phys_metrics:
         for mode in modes:
             m = df[df["collision_mode"] == mode]
@@ -263,19 +268,22 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
     for mode in modes:
         m = df[df["collision_mode"] == mode]
         n = len(m)
+        wt = m["wall_time_s"].dropna() if "wall_time_s" in m.columns else pd.Series([], dtype=float)
+        within_60 = int((wt <= 60.0).sum())
         md_rate_rows.append([
             mode,
-            _pct_plain(int(m["physics_settles"].sum()), n),
-            _pct_plain(int(m["flies_away"].sum()),      n),
-            _pct_plain(int(m["sinks_permanently"].sum()), n),
-            _pct_plain(int(m["sinks_below_floor"].sum()), n),
+            _pct_plain(int(m["physics_settles"].eq(True).sum()), n),
+            _pct_plain(int(m["physics_stable"].eq(True).sum()),  n),
+            _pct_plain(int(m["flies_away"].eq(True).sum()),      n),
+            _pct_plain(int(m["floor_penetration"].eq(True).sum()), n),
+            _pct_plain(within_60, len(wt)) if len(wt) else "–",
         ])
 
     md_sections.append("## Physics Stability\n")
     md_sections.append(f"**Assets evaluated:** {total}\n")
     md_sections.append("### Pass Rates\n")
     md_sections.append(_md_table(
-        ["Mode", "Settles", "Flies away", "Sinks permanently", "Sinks (trajectory)"],
+        ["Mode", "Settles", "Stable", "Flies away", "Floor penetration", "Within 60s"],
         md_rate_rows,
         bold_winners=True,
     ))
@@ -295,29 +303,29 @@ def physics_stats(csv_path: Path, out_dir: Path, summary_lines: list, md_section
         for _, row in m.iterrows():
             per_asset_rows.append([
                 row["asset_id"],
-                "✅" if row["physics_settles"] else "❌",
+                "✅" if row.get("physics_settles") else "❌",
+                "✅" if row.get("physics_stable") else "❌",
                 f"{row['displacement_m']:.4f}" if pd.notna(row["displacement_m"]) else "–",
-                "⚠️" if row["flies_away"] else "ok",
-                f"{row['final_y_offset_m']:.4f}" if pd.notna(row["final_y_offset_m"]) else "–",
-                "⚠️" if row["sinks_permanently"] else "ok",
-                f"{row['min_y_offset_m']:.4f}" if pd.notna(row["min_y_offset_m"]) else "–",
-                "⚠️" if row["sinks_below_floor"] else "ok",
-                f"{row['settle_time_s']:.3f}" if "settle_time_s" in row and pd.notna(row["settle_time_s"]) else "–",
+                "⚠️" if row.get("flies_away") else "ok",
+                f"{row['penetration_y_m']:.4f}" if pd.notna(row.get("penetration_y_m")) else "–",
+                "⚠️" if row.get("floor_penetration") else "ok",
+                f"{row['settle_time_s']:.3f}" if pd.notna(row.get("settle_time_s")) else "–",
+                f"{row['wall_time_s']:.1f}" if pd.notna(row.get("wall_time_s")) else "–",
                 row["error"] if pd.notna(row["error"]) else "",
             ])
         md_sections.append(_md_table(
-            ["Asset", "Settles", "XZ disp (m)", "Flies away", "Final Y offset (m)", "Sinks permanently", "Min Y offset (m)", "Sinks (trajectory)", "Settle time (s)", "Error"],
+            ["Asset", "Settles", "Stable", "XZ disp (m)", "Flies away",
+             "Penetration Y (m)", "Floor penetration", "Settle time (s)", "Wall time (s)", "Error"],
             per_asset_rows,
         ))
         md_sections.append("")
 
     # ── Figures ───────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     metrics = [
-        ("displacement_m",   "XZ Displacement (m)",  1.5),
-        ("final_y_offset_m", "Final Y Offset (m)",   None),
-        ("min_y_offset_m",   "Min Y Offset (m)",     None),
-        ("settle_time_s",    "Settle Time (s)",       None),
+        ("displacement_m",  "XZ Displacement (m)", 1.5),
+        ("penetration_y_m", "Penetration Y (m)",   -0.05),
+        ("settle_time_s",   "Settle Time (s)",      None),
     ]
     colors = {"convex_hull": "#3498db", "vhacd": "#e67e22"}
     for ax, (col, xlabel, vline) in zip(axes, metrics):
@@ -494,9 +502,11 @@ def _comparison_section(datasets: dict, check: str, metrics: list, md_sections: 
     for ds_name, results_dir in datasets.items():
         csv_path = results_dir / check / f"{check}_results.csv"
         if not csv_path.exists():
+            csv_path = results_dir / f"{check}_results.csv"
+        if not csv_path.exists():
             continue
         df = pd.read_csv(csv_path)
-        for col in ["physics_settles", "flies_away", "sinks_permanently", "sinks_below_floor"]:
+        for col in ["physics_settles", "physics_stable", "flies_away", "floor_penetration"]:
             if col in df.columns:
                 df[col] = df[col].map({"True": True, "False": False, True: True, False: False})
         modes = df["collision_mode"].unique().tolist()
@@ -540,6 +550,186 @@ def _comparison_section(datasets: dict, check: str, metrics: list, md_sections: 
     md_sections.append(_md_table(headers, rows))
 
 
+# ── Paper summary ────────────────────────────────────────────────────────────
+
+def _write_paper_summary(datasets: dict, out_path: Path):
+    """Write a clean, self-contained markdown summary for paper writing.
+
+    Intended to be sent directly to an article AI. Contains:
+      - Experiment description
+      - Per-dataset asset counts
+      - Cross-dataset physics pass-rate table (one row per dataset × mode)
+      - Cross-dataset wall-time / simulation tractability table
+      - Metric distribution table (mean ± std per dataset × mode)
+      - Plain-text key findings
+    """
+    lines = []
+    lines.append("# Physics Benchmark — Paper Summary\n")
+    lines.append(
+        "This document summarises the physics stability benchmark results across datasets. "
+        "Each object was spawned with its collision mesh AABB bottom 10 cm above the floor (Y=0) "
+        "and simulated for 10 seconds (600 steps at 60 Hz) under gravity. "
+        "Two collision representations were tested per asset: **convex_hull** (single convex hull "
+        "of the collision mesh) and **vhacd** (V-HACD multi-convex decomposition). "
+        "All metrics are computed from collision mesh vertices transformed to world space.\n"
+    )
+
+    lines.append("## Metric Definitions\n")
+    lines.append(
+        "| Metric | Definition |\n"
+        "| --- | --- |\n"
+        "| **physics_settles** | Linear velocity stayed below 0.01 m/s at some point during simulation |\n"
+        "| **physics_stable** | `physics_settles AND NOT flies_away AND NOT floor_penetration` — primary quality criterion |\n"
+        "| **flies_away** | XZ displacement from spawn > 1.5 m |\n"
+        "| **floor_penetration** | Collision mesh vertex penetrated more than 5 cm below floor (Y < −0.05 m) |\n"
+        "| **penetration_y_m** | Minimum world Y reached by any collision vertex during simulation, clamped to ≤ 0 |\n"
+        "| **displacement_m** | Final XZ distance from spawn position |\n"
+        "| **settle_time_s** | Time at which the object first reached and sustained the velocity threshold |\n"
+        "| **wall_time_s** | Wall-clock seconds for asset loading + hull building + full simulation (no image rendering) |\n"
+        "| **Within 60s** | Fraction of assets whose simulation completed within 60 s (simulation readiness) |\n"
+    )
+
+    # Collect data for all datasets
+    all_data = {}  # ds_name -> DataFrame
+    for ds_name, results_dir in datasets.items():
+        csv_path = results_dir / "physics_results.csv"
+        if not csv_path.exists():
+            csv_path = results_dir / "physics" / "physics_results.csv"
+        if not csv_path.exists():
+            continue
+        df = pd.read_csv(csv_path)
+        for col in ["physics_settles", "physics_stable", "flies_away", "floor_penetration"]:
+            if col in df.columns:
+                df[col] = df[col].map({"True": True, "False": False, True: True, False: False})
+        all_data[ds_name] = df
+
+    if not all_data:
+        lines.append("_No physics results found._\n")
+        out_path.write_text("\n".join(lines))
+        return
+
+    # Dataset overview
+    lines.append("## Dataset Overview\n")
+    overview_rows = []
+    for ds_name, df in all_data.items():
+        modes = df["collision_mode"].unique().tolist()
+        n = len(df[df["collision_mode"] == modes[0]])
+        errors = int(df[df["collision_mode"] == modes[0]]["error"].notna().sum())
+        overview_rows.append([ds_name, str(n), str(len(modes)), str(errors)])
+    lines.append(_md_table(["Dataset", "Assets", "Collision modes", "Errors/timeouts"], overview_rows))
+    lines.append("\n")
+
+    # Pass-rate comparison
+    lines.append("## Physics Pass Rates\n")
+    lines.append(
+        "Primary metric is **physics_stable** (settles + no flying + no floor penetration). "
+        "Winner per column is **bolded**.\n"
+    )
+    pass_rows = []
+    for ds_name, df in all_data.items():
+        for mode in df["collision_mode"].unique():
+            m = df[df["collision_mode"] == mode]
+            n = len(m)
+            wt = m["wall_time_s"].dropna() if "wall_time_s" in m.columns else pd.Series([], dtype=float)
+            within_60 = int((wt <= 60.0).sum())
+            pass_rows.append([
+                f"{ds_name} / {mode}",
+                _pct_plain(int(m["physics_settles"].eq(True).sum()), n),
+                _pct_plain(int(m["physics_stable"].eq(True).sum()),  n),
+                _pct_plain(int(m["flies_away"].eq(True).sum()),      n),
+                _pct_plain(int(m["floor_penetration"].eq(True).sum()), n),
+                _pct_plain(within_60, len(wt)) if len(wt) else "–",
+                str(int(m["error"].notna().sum())),
+            ])
+    lines.append(_md_table(
+        ["Dataset / Mode", "Settles", "Stable", "Flies away", "Floor penetration", "Within 60s", "Errors"],
+        pass_rows, bold_winners=True,
+    ))
+    lines.append("\n")
+
+    # Wall time table
+    lines.append("## Simulation Wall Time\n")
+    lines.append(
+        "Wall time covers asset loading, collision hull building, and the 600-step simulation. "
+        "**Within 60s** is the simulation readiness rate — assets exceeding 60 s are not tractable "
+        "for large-scale pipelines.\n"
+    )
+    wt_rows = []
+    for ds_name, df in all_data.items():
+        for mode in df["collision_mode"].unique():
+            m = df[df["collision_mode"] == mode]
+            wt = m["wall_time_s"].dropna() if "wall_time_s" in m.columns else pd.Series([], dtype=float)
+            if wt.empty:
+                wt_rows.append([f"{ds_name} / {mode}", "–", "–", "–", "–"])
+            else:
+                within_60 = int((wt <= 60.0).sum())
+                wt_rows.append([
+                    f"{ds_name} / {mode}",
+                    f"{wt.mean():.3f} ± {wt.std():.3f}",
+                    f"{wt.median():.3f}",
+                    f"{wt.max():.3f}",
+                    _pct_plain(within_60, len(wt)),
+                ])
+    lines.append(_md_table(
+        ["Dataset / Mode", "Mean ± Std (s)", "Median (s)", "Max (s)", "Within 60s"],
+        wt_rows, bold_winners=True,
+    ))
+    lines.append("\n")
+
+    # Metric distributions
+    lines.append("## Metric Distributions\n")
+    lines.append("Mean ± std, median, and interquartile range per dataset and collision mode.\n")
+    dist_cols = [
+        ("displacement_m",  "XZ displacement (m)", ".4f"),
+        ("penetration_y_m", "Penetration Y (m)",   ".4f"),
+        ("settle_time_s",   "Settle time (s)",      ".3f"),
+    ]
+    for csv_col, label, fmt in dist_cols:
+        lines.append(f"### {label}\n")
+        dist_rows = []
+        for ds_name, df in all_data.items():
+            for mode in df["collision_mode"].unique():
+                m = df[df["collision_mode"] == mode]
+                s = m[csv_col].dropna() if csv_col in m.columns else pd.Series([], dtype=float)
+                if s.empty:
+                    dist_rows.append([f"{ds_name} / {mode}", "–", "–", "–", "–"])
+                else:
+                    dist_rows.append([
+                        f"{ds_name} / {mode}",
+                        f"{s.mean():{fmt}} ± {s.std():{fmt}}",
+                        f"{s.median():{fmt}}",
+                        f"{s.quantile(0.25):{fmt}}",
+                        f"{s.quantile(0.75):{fmt}}",
+                    ])
+        lines.append(_md_table(
+            ["Dataset / Mode", "Mean ± Std", "Median", "P25", "P75"],
+            dist_rows, bold_winners=True,
+        ))
+        lines.append("\n")
+
+    # Key findings
+    lines.append("## Key Findings\n")
+    for ds_name, df in all_data.items():
+        lines.append(f"### {ds_name}\n")
+        for mode in df["collision_mode"].unique():
+            m = df[df["collision_mode"] == mode]
+            n = len(m)
+            stable = int(m["physics_stable"].eq(True).sum())
+            flies  = int(m["flies_away"].eq(True).sum())
+            pen    = int(m["floor_penetration"].eq(True).sum())
+            errors = int(m["error"].notna().sum())
+            wt     = m["wall_time_s"].dropna() if "wall_time_s" in m.columns else pd.Series([], dtype=float)
+            within_60 = int((wt <= 60.0).sum()) if len(wt) else 0
+            lines.append(
+                f"- **{mode}**: {stable}/{n} stable ({100*stable/n:.1f}%), "
+                f"{flies} fly away, {pen} floor penetration, {errors} errors"
+                + (f", {within_60}/{len(wt)} within 60s ({100*within_60/len(wt):.1f}%)" if len(wt) else "")
+            )
+        lines.append("")
+
+    out_path.write_text("\n".join(lines))
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -574,6 +764,8 @@ def main():
         summary_lines.append(f"\n{'='*40}\nDataset: {ds_name}\n{'='*40}")
 
         physics_csv = results_dir / "physics" / "physics_results.csv"
+        if not physics_csv.exists():
+            physics_csv = results_dir / "physics_results.csv"
         if physics_csv.exists():
             print(f"[{ds_name}] Processing physics...")
             physics_stats(physics_csv, args.out_dir / ds_name, summary_lines, md_sections)
@@ -581,6 +773,8 @@ def main():
             print(f"[{ds_name}] no physics CSV")
 
         grasp_csv = results_dir / "graspability" / "graspability_results.csv"
+        if not grasp_csv.exists():
+            grasp_csv = results_dir / "graspability_results.csv"
         if grasp_csv.exists():
             print(f"[{ds_name}] Processing graspability...")
             grasp_stats(grasp_csv, args.out_dir / ds_name, summary_lines, md_sections)
@@ -591,13 +785,13 @@ def main():
     if len(datasets) > 1:
         _comparison_section(datasets, "physics", [
             ("physics_settles",  "Settles",            ".1%", True),
+            ("physics_stable",   "Stable",             ".1%", True),
             ("displacement_m",   "XZ disp (m)",        ".4f", False),
-            ("final_y_offset_m", "final Y offset (m)", ".4f", True),
-            ("min_y_offset_m",   "min Y offset (m)",   ".4f", True),
+            ("penetration_y_m",  "penetration Y (m)",  ".4f", True),
             ("settle_time_s",    "settle time (s)",    ".3f", False),
+            ("wall_time_s",      "wall time (s)",      ".1f", False),
             ("flies_away",       "Flies away",         ".1%", False),
-            ("sinks_permanently","Sinks permanently",  ".1%", False),
-            ("sinks_below_floor","Sinks (trajectory)", ".1%", False),
+            ("floor_penetration","Floor penetration",  ".1%", False),
         ], md_sections)
         _comparison_section(datasets, "graspability", [
             ("grasp_success_rate", "success rate",  ".3f", True),
@@ -606,11 +800,13 @@ def main():
 
     (args.out_dir / "summary.txt").write_text("\n".join(summary_lines))
     (args.out_dir / "results.md").write_text("\n".join(md_sections))
+    _write_paper_summary(datasets, args.out_dir / "paper_summary.md")
 
     print(f"\nOutputs written to {args.out_dir}/")
-    print("  results.md, summary.txt, pass_rates.tex, distributions.tex, *.pdf")
-    print("  summary.txt")
-    print("  results.md")
+    print("  paper_summary.md  ← send this to the article AI")
+    print("  results.md        ← full detail including per-asset tables")
+    print("  summary.txt       ← plain-text numbers")
+    print("  pass_rates.tex, distributions.tex, *.pdf")
 
 
 if __name__ == "__main__":

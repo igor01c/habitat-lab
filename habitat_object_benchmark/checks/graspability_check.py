@@ -1455,3 +1455,498 @@ def run(sim, robot, ik_solver, asset_handle: str,
                 pass
 
     return result
+
+
+# ── Snap-based graspability (suction-cup model) ───────────────────────────────
+# Completely independent of run() / _run_trial().  Uses the same Fetch robot
+# and IK solver already loaded in the worker, but never closes the gripper.
+# Instead, once the EE is within SNAP_THRESHOLD of the object centre the object
+# is rigidly attached (kinematic) and lifted.  This mirrors what
+# RearrangeGraspManager does during RL training.
+#
+# Metrics returned in the same dict schema as run() so both can be stored in the
+# same CSV row or compared directly.
+
+SNAP_THRESHOLD     = 0.15   # m — EE must be within this distance to count as "snapped"
+SNAP_HOLD_STEPS    = 30     # steps held at grasp pose before lift
+SNAP_LIFT_STEPS    = 80     # physics steps for the lift phase
+SNAP_RELEASE_STEPS = 30     # steps with object released before checking fall
+
+
+def _run_snap_trial(sim, robot, ik_solver, use_handle,
+                    candidate, snap_pos, table_top_y: float,
+                    table_obj_id: int = None,
+                    capture: bool = False):
+    """
+    Single snap-based grasp trial.
+
+    candidate = (cand, M, x_grip, z_grip)  — same format as _run_trial.
+
+    Steps:
+      1. Spawn + settle object at snap_pos.
+      2. Solve IK for EE at world_M.
+      3. Move arm REST → pre-grasp → grasp pose (object stays KINEMATIC throughout).
+      4. Measure EE-to-object distance.  If > SNAP_THRESHOLD → no snap, record failure.
+      5. Attach object to EE (rigid kinematic follow) for SNAP_HOLD_STEPS.
+      6. Motor-driven lift; object follows EE each step.
+      7. Check object rose by LIFT_THRESHOLD.
+      8. Release object (DYNAMIC); check it falls.
+
+    Returns dict with:
+      success, ee_dist_m, ik_error, obj_y_rise, frames, grasp_close_idx
+    """
+    import types
+    from habitat_sim.physics import JointMotorSettings
+
+    cand, M, x_grip, z_grip = candidate
+
+    rom = sim.get_rigid_object_manager()
+    ao  = robot.sim_obj
+    obj = None
+    torso_patched = False
+
+    try:
+        # ── Rotate object so x_grip faces the robot (same as _run_trial) ────────
+        theta_y = math.atan2(float(x_grip[2]), float(x_grip[0]))
+        rot_y   = mn.Quaternion.rotation(mn.Rad(theta_y), mn.Vector3(0, 1, 0))
+        cy, sy  = math.cos(theta_y), math.sin(theta_y)
+        R_y     = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=float)
+
+        # ── Spawn + snap onto table ───────────────────────────────────────────────
+        # snap_pos was computed with identity rotation.  With rot_y applied the
+        # object's bottom face may differ, so we use snap_down (same as _get_snap_pos)
+        # with the table as the only valid support surface — this guarantees the object
+        # lands on the table regardless of orientation.
+        obj = rom.add_object_by_template_handle(use_handle)
+        if obj is None or not obj.is_alive:
+            return {"success": False, "ee_dist_m": None, "ik_error": None,
+                    "frames": [], "obj_y_rise": 0.0, "grasp_close_idx": None}
+        bb  = obj.root_scene_node.cumulative_bb
+        obj.translation = mn.Vector3(float(snap_pos[0]),
+                                     table_top_y + 0.3 - float(bb.min[1]),
+                                     float(snap_pos[2]))
+        obj.rotation    = rot_y
+        obj.motion_type = habitat_sim.physics.MotionType.DYNAMIC
+
+        saved_base = mn.Vector3(robot.base_pos)
+        robot.base_pos = mn.Vector3(50.0, FLOOR_Y, 0.0)
+        robot.update()
+        support = [table_obj_id] if table_obj_id is not None else None
+        snapped_ok = snap_down(sim, obj, support_obj_ids=support, max_collision_depth=0.5)
+        robot.base_pos = saved_base
+        robot.update()
+
+        if not snapped_ok:
+            rom.remove_object_by_id(obj.object_id)
+            obj = None
+            return {"success": False, "ee_dist_m": None, "ik_error": None,
+                    "frames": [], "obj_y_rise": 0.0, "grasp_close_idx": None}
+
+        settled_t = np.array(obj.translation)
+        world_M   = settled_t + R_y @ np.array(M)
+
+        # Freeze while setting up IK
+        obj.motion_type = habitat_sim.physics.MotionType.KINEMATIC
+        obj.translation = mn.Vector3(*settled_t.tolist())
+        obj.rotation    = rot_y
+
+        wp_grasp    = world_M.copy()
+        wp_pregrasp = wp_grasp + np.array([0.0, 0.20, 0.0])
+
+        FIXED_ANGLE = 0.0
+        base_x   = float(settled_t[0]) + APPROACH_DIST * math.sin(FIXED_ANGLE)
+        base_z   = float(settled_t[2]) + APPROACH_DIST * math.cos(FIXED_ANGLE)
+        base_xz  = np.array([base_x, base_z])
+        base_yaw = float(FIXED_ANGLE + math.pi)
+        orn_angle = FIXED_ANGLE
+
+        EE_CONTACT_OFFSET = np.array([0.0, 0.0, 0.0])
+
+        def _solve_relaxed(target, torso_override=None):
+            ik_target = target + EE_CONTACT_OFFSET
+            search    = [torso_override] if torso_override is not None else TORSO_SEARCH
+            best_angles, best_err, best_torso = None, float("inf"), TORSO_HEIGHT
+            for th in search:
+                angles, err = ik_solver.solve(base_xz, base_yaw, ik_target,
+                                              orn_angle, torso_height=float(th))
+                if angles is not None:
+                    return angles, float(th), err
+                if err < best_err:
+                    best_angles, best_err, best_torso = angles, err, float(th)
+            import pybullet as _p
+            c, r = ik_solver._client, ik_solver._robot
+            _p.resetBasePositionAndOrientation(
+                r, (float(base_xz[0]), 0.0, float(base_xz[1])),
+                _p.getQuaternionFromEuler([0, base_yaw - ik_solver._arm_forward_angle, 0]),
+                physicsClientId=c)
+            _p.resetJointState(r, PB_TORSO_JOINT, best_torso, physicsClientId=c)
+            ik = _p.calculateInverseKinematics(
+                r, PB_EE_LINK, ik_target.tolist(),
+                lowerLimits=ik_solver._lower, upperLimits=ik_solver._upper,
+                jointRanges=ik_solver._ranges, restPoses=ik_solver._rest,
+                residualThreshold=1e-5, maxNumIterations=1000, physicsClientId=c)
+            raw = np.zeros(len(PB_ARM_JOINTS), dtype=np.float32)
+            for dof_i, arm_i in ik_solver._dof_to_arm.items():
+                raw[arm_i] = ik[dof_i]
+            return raw, best_torso, best_err
+
+        angles_pre,   best_torso, _      = _solve_relaxed(wp_pregrasp)
+        angles_grasp, best_torso, ik_err = _solve_relaxed(wp_grasp)
+
+        if angles_grasp is None:
+            return {"success": False, "ee_dist_m": None,
+                    "ik_error": round(float(ik_err), 4),
+                    "frames": [], "obj_y_rise": 0.0, "grasp_close_idx": None}
+
+        # ── Place robot ───────────────────────────────────────────────────────────
+        hab_yaw = base_yaw - ik_solver._arm_forward_angle
+        robot.base_pos = mn.Vector3(base_x, FLOOR_Y, base_z)
+        robot.base_rot = hab_yaw
+        robot.arm_joint_pos = ARM_INIT.copy()
+        robot.gripper_joint_pos = np.array([GRIPPER_OPEN, GRIPPER_OPEN])
+        robot.update()
+
+        _orig_update   = robot.__class__.update
+        _desired_torso = best_torso
+
+        def _update_with_torso(self):
+            _orig_update(self)
+            self._set_joint_pos(self.back_joint_id, _desired_torso)
+            self._set_motor_pos(self.back_joint_id, _desired_torso)
+
+        robot.update  = types.MethodType(_update_with_torso, robot)
+        torso_patched = True
+        robot.update()
+
+        frames          = []
+        grasp_close_idx = None
+
+        if capture:
+            _setup_camera(sim,
+                          asset_pos=np.array([float(settled_t[0]), float(world_M[1]), float(settled_t[2])]),
+                          robot_base=np.array([base_x, FLOOR_Y, base_z]),
+                          cam_height=float(world_M[1]) + 1.2,
+                          lookat_y=float(world_M[1]),
+                          view_angle_deg=45.0)
+
+        def _cap():
+            if capture:
+                frames.append(_capture_frame(sim))
+
+        def _interp_arm(a, b, n=APPROACH_STEPS):
+            for i in range(1, n + 1):
+                robot.arm_joint_pos = a + (i / n) * (b - a)
+                robot.update()
+                sim.step_physics(1.0 / 60.0)
+                if i % 4 == 0:
+                    _cap()
+
+        def _cartesian_descent(start_pos, end_pos, n=APPROACH_STEPS):
+            import pybullet as _p
+            c, r    = ik_solver._client, ik_solver._robot
+            pb_base = (float(base_xz[0]), 0.0, float(base_xz[1]))
+            pb_orn  = _p.getQuaternionFromEuler(
+                [0, base_yaw - ik_solver._arm_forward_angle, 0])
+            current = angles_pre.copy()
+            _p.resetBasePositionAndOrientation(r, pb_base, pb_orn, physicsClientId=c)
+            _p.resetJointState(r, PB_TORSO_JOINT, best_torso, physicsClientId=c)
+            for k, ji in enumerate(PB_ARM_JOINTS):
+                _p.resetJointState(r, ji, float(current[k]), physicsClientId=c)
+            for i in range(1, n + 1):
+                t      = i / n
+                target = np.asarray(start_pos) + t * (np.asarray(end_pos) - np.asarray(start_pos))
+                _p.resetBasePositionAndOrientation(r, pb_base, pb_orn, physicsClientId=c)
+                _p.resetJointState(r, PB_TORSO_JOINT, best_torso, physicsClientId=c)
+                ik = _p.calculateInverseKinematics(
+                    r, PB_EE_LINK, target.tolist(),
+                    lowerLimits=ik_solver._lower, upperLimits=ik_solver._upper,
+                    jointRanges=ik_solver._ranges, restPoses=ik_solver._rest,
+                    residualThreshold=1e-5, maxNumIterations=200, physicsClientId=c)
+                new_angles = np.zeros(len(PB_ARM_JOINTS), dtype=np.float32)
+                for dof_i, arm_i in ik_solver._dof_to_arm.items():
+                    new_angles[arm_i] = ik[dof_i]
+                for k, ji in enumerate(PB_ARM_JOINTS):
+                    _p.resetJointState(r, ji, float(new_angles[k]), physicsClientId=c)
+                current = new_angles
+                robot.arm_joint_pos = current
+                robot.update()
+                sim.step_physics(1.0 / 60.0)
+                if i % 4 == 0:
+                    _cap()
+            return current
+
+        # Object stays KINEMATIC throughout — no physics interaction with fingers
+        _interp_arm(ARM_INIT, angles_pre)
+        final_grasp_angles = _cartesian_descent(wp_pregrasp, wp_grasp)
+        grasp_close_idx = len(frames) - 1
+
+        # ── Measure EE-to-object distance ─────────────────────────────────────
+        ee_pos  = np.array(robot.ee_transform(0).translation)
+        obj_pos = np.array(obj.translation)
+        ee_dist = float(np.linalg.norm(ee_pos - obj_pos))
+        snapped = ee_dist <= SNAP_THRESHOLD
+
+        if not snapped:
+            return {"success": False, "ee_dist_m": round(ee_dist, 4),
+                    "ik_error": round(float(ik_err), 4),
+                    "frames": frames, "obj_y_rise": 0.0,
+                    "grasp_close_idx": grasp_close_idx}
+
+        # ── Snap: rigidly attach object to EE ────────────────────────────────
+        # Compute the object pose relative to the EE so we can follow it each step.
+        ee_T     = robot.ee_transform(0)
+        ee_T_inv = ee_T.inverted()
+        obj_T    = obj.transformation
+        rel_T    = ee_T_inv @ obj_T   # object pose in EE-local frame
+
+        def _follow_ee():
+            obj.transformation = robot.ee_transform(0) @ rel_T
+
+        _cap()
+        for _ in range(SNAP_HOLD_STEPS):
+            robot.arm_joint_pos = final_grasp_angles
+            robot.update()
+            _follow_ee()
+            sim.step_physics(1.0 / 60.0)
+            _cap()
+
+        # ── Cartesian lift — EE tracks a straight vertical line ───────────────
+        # Using kinematic IK (same warm-started loop as _cartesian_descent) keeps
+        # the EE on a straight upward path.  Motor-driven lift causes lateral
+        # swinging because joints race to target in joint space independently.
+        import pybullet as _p
+        c_pb, r_pb  = ik_solver._client, ik_solver._robot
+        pb_base = (float(base_xz[0]), 0.0, float(base_xz[1]))
+        pb_orn  = _p.getQuaternionFromEuler(
+            [0, base_yaw - ik_solver._arm_forward_angle, 0])
+        current_lift = final_grasp_angles.copy()
+        _p.resetBasePositionAndOrientation(r_pb, pb_base, pb_orn, physicsClientId=c_pb)
+        _p.resetJointState(r_pb, PB_TORSO_JOINT, best_torso, physicsClientId=c_pb)
+        for k, ji in enumerate(PB_ARM_JOINTS):
+            _p.resetJointState(r_pb, ji, float(current_lift[k]), physicsClientId=c_pb)
+
+        obj_y_before_lift = float(obj.translation[1])
+        lift_start = wp_grasp.copy()
+        lift_end   = wp_grasp + np.array([0.0, LIFT_HEIGHT, 0.0])
+
+        for i in range(1, SNAP_LIFT_STEPS + 1):
+            t      = i / SNAP_LIFT_STEPS
+            target = lift_start + t * (lift_end - lift_start)
+            _p.resetBasePositionAndOrientation(r_pb, pb_base, pb_orn, physicsClientId=c_pb)
+            _p.resetJointState(r_pb, PB_TORSO_JOINT, best_torso, physicsClientId=c_pb)
+            ik = _p.calculateInverseKinematics(
+                r_pb, PB_EE_LINK, target.tolist(),
+                lowerLimits=ik_solver._lower, upperLimits=ik_solver._upper,
+                jointRanges=ik_solver._ranges, restPoses=ik_solver._rest,
+                residualThreshold=1e-5, maxNumIterations=200, physicsClientId=c_pb)
+            new_angles = np.zeros(len(PB_ARM_JOINTS), dtype=np.float32)
+            for dof_i, arm_i in ik_solver._dof_to_arm.items():
+                new_angles[arm_i] = ik[dof_i]
+            for k, ji in enumerate(PB_ARM_JOINTS):
+                _p.resetJointState(r_pb, ji, float(new_angles[k]), physicsClientId=c_pb)
+            current_lift = new_angles
+            robot.arm_joint_pos = current_lift
+            robot.update()
+            sim.step_physics(1.0 / 60.0)
+            _follow_ee()
+            if i % 4 == 0:
+                _cap()
+
+        obj_y_after_lift = float(obj.translation[1])
+        lifted_enough    = (obj_y_after_lift - obj_y_before_lift) > LIFT_THRESHOLD
+
+        # ── Release: switch to DYNAMIC and let the object fall ────────────────
+        obj.motion_type = habitat_sim.physics.MotionType.DYNAMIC
+        for i in range(SNAP_RELEASE_STEPS):
+            sim.step_physics(1.0 / 60.0)
+            if i % 4 == 0:
+                _cap()
+
+        obj_y_after_open = float(obj.translation[1])
+        fell    = (obj_y_after_lift - obj_y_after_open) > FALL_THRESHOLD
+        success = lifted_enough and fell
+        obj_y_rise = max(0.0, obj_y_after_lift - float(snap_pos[1]))
+
+        return {"success": success, "ee_dist_m": round(ee_dist, 4),
+                "ik_error": round(float(ik_err), 4),
+                "frames": frames, "obj_y_rise": round(obj_y_rise, 4),
+                "grasp_close_idx": grasp_close_idx}
+
+    finally:
+        if torso_patched:
+            try:
+                del robot.update
+            except AttributeError:
+                pass
+        if obj is not None and obj.is_alive:
+            rom.remove_object_by_id(obj.object_id)
+
+
+def run_snap(sim, robot, ik_solver, asset_handle: str,
+             collision_mode: str = "convex_hull",
+             save_dir: str = None, asset_id: str = None) -> dict:
+    """Snap-based graspability check (suction-cup model).
+
+    Same interface as run() — drop-in replacement for comparison.
+    Does not close the gripper; instead snaps the object to the EE when
+    within SNAP_THRESHOLD and lifts it kinematically.
+
+    Extra keys in the returned dict:
+      snap_rate      — fraction of trials where EE reached within SNAP_THRESHOLD
+      mean_ee_dist_m — mean EE-to-object distance at grasp pose across all trials
+    """
+    result = {
+        "collision_mode":     collision_mode,
+        "grasp_success_rate": None,
+        "grasp_successes":    None,
+        "grasp_trials":       GRASP_CANDIDATES,
+        "mean_grasp_width_m": None,
+        "snap_rate":          None,
+        "mean_ee_dist_m":     None,
+        "error":              None,
+    }
+
+    otm = sim.get_object_template_manager()
+    rom = sim.get_rigid_object_manager()
+    table_obj_id = None
+    try:
+        otm.load_configs(TABLE_CFG)
+        table_handles = otm.get_template_handles("frl_apartment_table_01")
+        if table_handles:
+            table = rom.add_object_by_template_handle(table_handles[0])
+            tbb   = table.root_scene_node.cumulative_bb
+            table.translation = mn.Vector3(0, -float(tbb.min[1]), 0)
+            table.motion_type = habitat_sim.physics.MotionType.STATIC
+            table_obj_id = table.object_id
+            table_top_y  = -float(tbb.min[1]) + float(tbb.max[1])
+        else:
+            table_top_y = FLOOR_Y
+
+        template      = otm.get_template_by_handle(asset_handle)
+        config_dir    = os.path.dirname(asset_handle)
+        config_parent = os.path.dirname(config_dir)
+
+        if collision_mode == "convex_hull":
+            otm.register_template(template, asset_handle + "__snap_convex_hull")
+            use_handle = asset_handle + "__snap_convex_hull"
+            collision_rel = template.collision_asset_handle
+            if collision_rel and not os.path.isabs(collision_rel):
+                collision_mesh_path = os.path.normpath(os.path.join(config_parent, collision_rel))
+            else:
+                collision_mesh_path = collision_rel or ""
+        elif collision_mode == "vhacd":
+            render_rel = template.render_asset_handle
+            if render_rel and not os.path.isabs(render_rel):
+                render_abs = os.path.normpath(os.path.join(config_parent, render_rel))
+            else:
+                render_abs = render_rel or ""
+            vhacd = render_abs.replace(".glb", ".vhacd.glb")
+            if not os.path.exists(vhacd):
+                result["error"] = f"vhacd not found: {vhacd}"
+                return result
+            template.collision_asset_handle = vhacd
+            template.join_collision_meshes  = False
+            otm.register_template(template, asset_handle + "__snap_vhacd")
+            use_handle = asset_handle + "__snap_vhacd"
+            collision_mesh_path = vhacd
+        else:
+            raise ValueError(f"Unknown collision_mode: {collision_mode}")
+
+        snap_pos, _ = _get_snap_pos(sim, robot, use_handle, table_top_y,
+                                    support_obj_ids=[table_obj_id] if table_obj_id is not None else None)
+        if snap_pos is None:
+            result["error"] = "snap_down failed"
+            return result
+
+        # ── Sample antipodal candidates (same pipeline as run()) ──────────────
+        mesh           = None
+        mesh_bb_center = None
+        candidates     = []
+        if collision_mesh_path and os.path.exists(collision_mesh_path):
+            try:
+                loaded = _load_glb_mesh(collision_mesh_path)
+                tmpl_scale = template.scale
+                scale_xyz  = np.array([tmpl_scale[0], tmpl_scale[1], tmpl_scale[2]], dtype=float)
+                if not np.allclose(scale_xyz, 1.0):
+                    loaded = loaded.copy()
+                    loaded.vertices *= scale_xyz
+                mesh           = loaded
+                mesh_bb_center = (np.array(mesh.bounds[0]) + np.array(mesh.bounds[1])) / 2.0
+                candidates, _, _ = _sample_candidates(mesh, n_samples=500)
+            except Exception:
+                pass
+
+        if mesh_bb_center is None:
+            mesh_bb_center = np.zeros(3)
+
+        if not candidates:
+            _tmp = rom.add_object_by_template_handle(use_handle)
+            if _tmp is not None and _tmp.is_alive:
+                _tmp.translation = mn.Vector3(*snap_pos.tolist())
+                abb = _tmp.root_scene_node.cumulative_bb
+                abb_c_local = np.array([(float(abb.min[i]) + float(abb.max[i])) / 2.0 for i in range(3)])
+                rom.remove_object_by_id(_tmp.object_id)
+            else:
+                abb_c_local = np.zeros(3)
+            M_fallback    = abb_c_local
+            x_fallback    = np.array([1.0, 0.0, 0.0])
+            fallback_cand = (1.0, M_fallback, M_fallback, 0.04)
+            cand_list = []
+            for ang in np.linspace(0, 2 * np.pi, GRASP_CANDIDATES, endpoint=False):
+                z_ang = np.array([float(np.sin(ang)), 0.0, float(np.cos(ang))])
+                cand_list.append((fallback_cand, M_fallback, x_fallback, z_ang))
+            cand_list = cand_list[:GRASP_CANDIDATES]
+        else:
+            cand_list = []
+            for c in candidates[:GRASP_CANDIDATES]:
+                _, p1, p2, _ = c
+                M_a, x_a, y_a, z_a = _grasp_frame(p1, p2)
+                M_hab = np.array(M_a) - mesh_bb_center
+                cand_list.append((c, M_hab, x_a, z_a))
+
+        capturing   = save_dir is not None and asset_id is not None
+        all_results = []
+        successes   = 0
+        snaps       = 0
+        ee_dists    = []
+        n_trials    = len(cand_list)
+
+        for cand, M_a, x_a, z_a in cand_list:
+            r = _run_snap_trial(sim, robot, ik_solver, use_handle,
+                                (cand, M_a, x_a, z_a), snap_pos, table_top_y,
+                                table_obj_id=table_obj_id,
+                                capture=capturing)
+            all_results.append(r)
+            if r["success"]:
+                successes += 1
+            if r["ee_dist_m"] is not None:
+                ee_dists.append(r["ee_dist_m"])
+                if r["ee_dist_m"] <= SNAP_THRESHOLD:
+                    snaps += 1
+
+        if capturing and all_results:
+            best = _pick_best_trial(all_results)
+            if best.get("frames"):
+                os.makedirs(save_dir, exist_ok=True)
+                _save_gif(best["frames"], os.path.join(save_dir, f"{asset_id}.gif"))
+
+        result["grasp_successes"]    = successes
+        result["grasp_trials"]       = n_trials
+        result["grasp_success_rate"] = round(successes / n_trials, 4) if n_trials else 0.0
+        result["mean_grasp_width_m"] = None   # not applicable for snap
+        result["snap_rate"]          = round(snaps / n_trials, 4) if n_trials else 0.0
+        result["mean_ee_dist_m"]     = round(float(np.mean(ee_dists)), 4) if ee_dists else None
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    finally:
+        if table_obj_id is not None:
+            try:
+                rom.remove_object_by_id(table_obj_id)
+            except Exception:
+                pass
+
+    return result

@@ -70,17 +70,18 @@ def load_physics(csv_path: Path, images_dir: Path, json_out: Path) -> dict:
         for r in csv.DictReader(f):
             asset_id = r["asset_id"]
             mode     = r["collision_mode"]
+            error = r["error"] or None
             entry = {
-                "physics_settles":        _parse_bool(r["physics_settles"]),
-                "displacement_m":         _parse_float(r["displacement_m"]),
-                "flies_away":             _parse_bool(r["flies_away"]),
-                "final_y_offset_m":       _parse_float(r["final_y_offset_m"]),
-                "sinks_permanently":      _parse_bool(r["sinks_permanently"]),
-                "min_y_offset_m":         _parse_float(r["min_y_offset_m"]),
-                "sinks_below_floor":      _parse_bool(r["sinks_below_floor"]),
-                "contact_points_at_rest": _parse_int(r["contact_points_at_rest"]),
-                "settle_time_s":          _parse_float(r["settle_time_s"]) if "settle_time_s" in r else None,
-                "error":                  r["error"] or None,
+                "physics_settles":        None if error else _parse_bool(r.get("physics_settles")),
+                "physics_stable":         None if error else _parse_bool(r.get("physics_stable")),
+                "displacement_m":         None if error else _parse_float(r.get("displacement_m")),
+                "flies_away":             None if error else _parse_bool(r.get("flies_away")),
+                "penetration_y_m":        None if error else _parse_float(r.get("penetration_y_m")),
+                "floor_penetration":      None if error else _parse_bool(r.get("floor_penetration")),
+                "contact_points_at_rest": None if error else _parse_int(r.get("contact_points_at_rest")),
+                "settle_time_s":          None if error else _parse_float(r.get("settle_time_s")),
+                "wall_time_s":            _parse_float(r.get("wall_time_s")),
+                "error":                  error,
                 "gif":                    _gif_path(images_dir / mode / f"{asset_id}.gif", json_out),
             }
             data.setdefault(asset_id, {})[mode] = entry
@@ -95,20 +96,24 @@ def merge_checks(results_dir: Path, json_out: Path) -> dict:
     def _update(asset_id, check_name, payload):
         assets.setdefault(asset_id, {})[check_name] = payload
 
-    # Physics
+    # Physics — support both flat (legacy) and subdirectory layout
     physics_csv = results_dir / "physics" / "physics_results.csv"
+    if not physics_csv.exists():
+        physics_csv = results_dir / "physics_results.csv"
     if physics_csv.exists():
-        physics_images = results_dir / "physics" / "images"
+        physics_images = physics_csv.parent / "images"
         print(f"Loading physics results from {physics_csv}")
         for asset_id, modes in load_physics(physics_csv, physics_images, json_out).items():
             _update(asset_id, "physics", modes)
     else:
         print(f"  (no physics CSV found at {physics_csv})")
 
-    # Graspability
+    # Graspability — support both flat (legacy) and subdirectory layout
     grasp_csv = results_dir / "graspability" / "graspability_results.csv"
+    if not grasp_csv.exists():
+        grasp_csv = results_dir / "graspability_results.csv"
     if grasp_csv.exists():
-        grasp_images = results_dir / "graspability" / "images"
+        grasp_images = grasp_csv.parent / "images"
         print(f"Loading graspability results from {grasp_csv}")
         for asset_id, modes in load_graspability(grasp_csv, grasp_images, json_out).items():
             _update(asset_id, "graspability", modes)

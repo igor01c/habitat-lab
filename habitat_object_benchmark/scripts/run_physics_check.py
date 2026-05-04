@@ -22,13 +22,13 @@ FIELDNAMES = [
     "asset_id",
     "collision_mode",
     "physics_settles",
+    "physics_stable",
     "displacement_m",
     "flies_away",
-    "final_y_offset_m",
-    "sinks_permanently",
-    "min_y_offset_m",
-    "sinks_below_floor",
+    "penetration_y_m",
+    "floor_penetration",
     "settle_time_s",
+    "wall_time_s",
     "contact_points_at_rest",
     "error",
 ]
@@ -39,9 +39,14 @@ _modes = None
 _images_dirs = None
 _config_dir = None
 _timeout_s = None
+_debug_html_dir = None
 
 
-def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s):
+_penetration_method = None
+
+
+def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s,
+                 debug_html_dir=None, penetration_method="vertex"):
     os.environ["MAGNUM_LOG"] = "quiet"
     os.environ["MAGNUM_GPU_VALIDATION"] = "off"
     os.environ["HABITAT_SIM_LOG"] = "quiet"
@@ -52,10 +57,12 @@ def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s)
     sys.stderr = devnull
     os.dup2(devnull.fileno(), 2)
 
-    global _sim, _modes, _images_dirs, _config_dir, _timeout_s
+    global _sim, _modes, _images_dirs, _config_dir, _timeout_s, _debug_html_dir, _penetration_method
     _modes = modes
     _config_dir = config_dir
     _timeout_s = timeout_s
+    _debug_html_dir = debug_html_dir
+    _penetration_method = penetration_method
     _sim = make_sim(scene_path=scene_path, with_renderer=save_images, simple_floor=True)
     # Do NOT bulk-load all configs here — load each template lazily in _process_asset
     # to avoid stalling workers on large GLB datasets (e.g. Objaverse).
@@ -79,16 +86,23 @@ def _process_asset(asset_id):
     if not handles:
         for mode in _modes:
             rows.append({"asset_id": asset_id, "collision_mode": mode,
-                         "physics_settles": False, "displacement_m": None,
-                         "flies_away": None, "final_y_offset_m": None,
-                         "sinks_permanently": None, "min_y_offset_m": None,
-                         "sinks_below_floor": None,
+                         "physics_settles": None, "physics_stable": None,
+                         "displacement_m": None, "flies_away": None,
+                         "penetration_y_m": None, "floor_penetration": None,
+                         "settle_time_s": None, "wall_time_s": None,
                          "contact_points_at_rest": None, "error": "handle not found"})
         return rows
     for mode in _modes:
+        debug_html = None
+        if _debug_html_dir is not None:
+            d = Path(_debug_html_dir) / mode
+            d.mkdir(parents=True, exist_ok=True)
+            debug_html = str(d / f"{asset_id}.html")
         result = physics_check.run(
             _sim, handles[0], collision_mode=mode,
             save_dir=_images_dirs[mode], asset_id=asset_id,
+            config_json_path=cfg_path, debug_html=debug_html,
+            penetration_method=_penetration_method,
         )
         rows.append({"asset_id": asset_id, **result})
     return rows
@@ -96,11 +110,12 @@ def _process_asset(asset_id):
 
 def _error_rows(asset_id, modes, msg):
     return [{"asset_id": asset_id, "collision_mode": m,
-             "physics_settles": False, "displacement_m": None,
-             "flies_away": None, "final_y_offset_m": None,
-             "sinks_permanently": None, "min_y_offset_m": None,
-             "sinks_below_floor": None, "settle_time_s": None,
-             "contact_points_at_rest": None, "error": msg} for m in modes]
+             "physics_settles": None, "physics_stable": None,
+             "displacement_m": None, "flies_away": None,
+             "penetration_y_m": None, "floor_penetration": None,
+             "settle_time_s": None, "wall_time_s": None,
+             "contact_points_at_rest": None,
+             "error": msg} for m in modes]
 
 
 def _run_batch(asset_ids_batch, init_args, workers, csv_file, writer, progress):
@@ -123,9 +138,7 @@ def _run_batch(asset_ids_batch, init_args, workers, csv_file, writer, progress):
                 rows = future.get(timeout=timeout_s)
             except mp.TimeoutError:
                 tqdm.write(f"  TIMEOUT ({timeout_s}s): {asset_id}")
-                pool.terminate()
-                pool.join()
-                raise _PoolDead()
+                rows = _error_rows(asset_id, modes, f"timeout>{timeout_s}s")
             except Exception as e:
                 rows = _error_rows(asset_id, modes, str(e))
             for row in rows:
@@ -146,8 +159,6 @@ def _run_batch(asset_ids_batch, init_args, workers, csv_file, writer, progress):
         for future, aid in pending:
             _drain_one(future, aid)
 
-    except _PoolDead:
-        pass  # pool already terminated; remaining assets retried on next --resume
     except Exception as e:
         tqdm.write(f"  _run_batch unexpected error: {e}")
     finally:
@@ -159,10 +170,6 @@ def _run_batch(asset_ids_batch, init_args, workers, csv_file, writer, progress):
             pool.join(timeout=10)
         except Exception:
             pass
-
-
-class _PoolDead(Exception):
-    pass
 
 
 def main():
@@ -181,12 +188,28 @@ def main():
                         help="Per-asset timeout in seconds before marking as error (default: 20)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip assets already present in the output CSV")
+    parser.add_argument("--debug-html-dir", type=Path, default=None,
+                        help="Save a 3D HTML debug visualisation (floor + transformed mesh "
+                             "vertices at final pose) for each asset into this directory")
+    parser.add_argument("--include", nargs="+", metavar="ASSET_ID",
+                        help="Run only these asset IDs (space-separated, or use multiple times)")
+    parser.add_argument("--penetration-method",
+                        choices=["vertex", "contact", "raycast"], default="vertex",
+                        help="Method for floor penetration tracking: "
+                             "vertex (trimesh, default), contact (Bullet contact points), "
+                             "raycast (upward ray per step)")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     configs = sorted(args.config_dir.glob("*.object_config.json"))
     if not configs:
         raise FileNotFoundError(f"No .object_config.json files in {args.config_dir}")
+    if args.include is not None:
+        include_set = set(args.include)
+        configs = [c for c in configs if c.stem.replace(".object_config", "") in include_set]
+        if not configs:
+            raise FileNotFoundError(f"None of the --include asset IDs found in {args.config_dir}")
+        print(f"(--include: running {len(configs)} specified assets)")
     if args.limit is not None:
         configs = configs[: args.limit]
         print(f"(--limit {args.limit}: testing on first {len(configs)} assets)")
@@ -212,11 +235,14 @@ def main():
         return
 
     print(f"Running physics check on {len(asset_ids)} assets "
-          f"(modes: {modes}, workers: {args.workers}, batch_size: {args.batch_size})...")
+          f"(modes: {modes}, workers: {args.workers}, batch_size: {args.batch_size}, "
+          f"penetration: {args.penetration_method})...")
 
     init_args = (
         str(args.config_dir), args.scene, args.save_images,
         modes, str(args.out_dir), args.timeout,
+        str(args.debug_html_dir) if args.debug_html_dir else None,
+        args.penetration_method,
     )
 
     open_mode = "a" if args.resume else "w"
@@ -241,18 +267,26 @@ def main():
     df = pd.read_csv(csv_path)
     for mode in modes:
         m = df[df["collision_mode"] == mode]
-        settled = m["physics_settles"].sum()
-        flies   = m["flies_away"].sum()
-        perm    = m["sinks_permanently"].sum()
-        traj    = m["sinks_below_floor"].sum()
-        print(f"\n[{mode}]  settled: {settled}/{len(m)} ({100*settled/len(m):.1f}%)")
-        print(f"  flies_away:          {flies}")
-        print(f"  sinks_permanently:   {perm}  (final_y < -0.10 m)")
-        print(f"  sinks_below_floor:   {traj}  (min_y < -0.15 m)")
+        n = len(m)
+        settles  = m["physics_settles"].eq(True).sum()
+        stable   = m["physics_stable"].eq(True).sum()
+        flies    = m["flies_away"].eq(True).sum()
+        pen      = m["floor_penetration"].eq(True).sum()
+        errors   = m["error"].notna().sum()
+        # wall_time_s stats (excludes error/timeout rows which have NaN)
+        wt = m["wall_time_s"].dropna()
+        within_60s = int((wt <= 60.0).sum())
+        total_w = len(wt)
+        print(f"\n[{mode}]  settles: {settles}/{n}  stable: {stable}/{n}")
+        print(f"  flies_away:        {flies}")
+        print(f"  floor_penetration: {pen}  (penetration_y < -0.05 m)")
         print(f"  mean displacement_m:  {m['displacement_m'].mean():.4f}")
-        print(f"  mean final_y_offset:  {m['final_y_offset_m'].mean():.4f}")
-        print(f"  mean min_y_offset:    {m['min_y_offset_m'].mean():.4f}")
-        print(f"  errors:               {m['error'].notna().sum()}")
+        print(f"  mean penetration_y_m: {m['penetration_y_m'].mean():.4f}")
+        print(f"  errors/timeouts:      {errors}")
+        if total_w > 0:
+            print(f"  wall_time: mean={wt.mean():.3f}s  median={wt.median():.3f}s  "
+                  f"max={wt.max():.3f}s  within_60s={within_60s}/{total_w} "
+                  f"({100*within_60s/total_w:.1f}%)")
 
     print(f"\nFull results: {csv_path}")
 

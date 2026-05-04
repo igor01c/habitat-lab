@@ -11,6 +11,15 @@
   header h1 { font-size: 1.2rem; color: #fff; }
   #stats { margin-top: 6px; font-size: 0.82rem; color: #888; }
 
+  #tabs { display: flex; background: #111; border-bottom: 1px solid #2a2a2a; padding: 0 24px; }
+  .tab {
+    padding: 10px 22px; cursor: pointer; font-size: 0.88rem; color: #888;
+    border-bottom: 3px solid transparent; transition: color .15s, border-color .15s;
+    user-select: none;
+  }
+  .tab:hover { color: #ccc; }
+  .tab.active { color: #fff; border-bottom-color: #3498db; }
+
   #controls {
     display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 24px;
     background: #141414; border-bottom: 1px solid #2a2a2a; align-items: flex-end;
@@ -134,6 +143,8 @@
   <div id="stats"></div>
 </header>
 
+<div id="tabs"></div>
+
 <div id="controls">
   <div class="ctrl-group">
     <label>Search</label>
@@ -156,7 +167,7 @@
     </select>
   </div>
   <div class="ctrl-group">
-    <label>Sinks</label>
+    <label>Floor penetration</label>
     <select id="f-sinks">
       <option value="">All</option>
       <option value="true">Yes</option>
@@ -193,6 +204,8 @@
     <select id="f-sort">
       <option value="name">Asset name</option>
       <option value="displacement">XZ Displacement (m)</option>
+      <option value="penetration">Penetration Y (m)</option>
+      <option value="walltime">Wall time (s)</option>
       <option value="contacts">Contact points</option>
     </select>
   </div>
@@ -239,8 +252,27 @@ async function loadData() {
   }
   document.getElementById('loading').style.display = 'none';
 
-  CARDS = buildCards(data.assets);
-  applyFilters();
+  // Support both single-dataset {assets: {...}} and multi-dataset {datasets: {name: {assets: {...}}}}
+  if (data.assets) {
+    CARDS = buildCards(data.assets, '');
+    applyFilters();
+  } else if (data.datasets) {
+    const names = Object.keys(data.datasets);
+    const tabsEl = document.getElementById('tabs');
+
+    const switchTab = name => {
+      tabsEl.querySelectorAll('.tab').forEach(t =>
+        t.classList.toggle('active', t.dataset.name === name));
+      CARDS = buildCards(data.datasets[name]?.assets || {}, name);
+      applyFilters();
+    };
+
+    tabsEl.innerHTML = names.map(n =>
+      `<div class="tab" data-name="${n}">${n}</div>`).join('');
+    tabsEl.querySelectorAll('.tab').forEach(t =>
+      t.addEventListener('click', () => switchTab(t.dataset.name)));
+    switchTab(names[0]);
+  }
 }
 
 function buildCards(assets) {
@@ -294,8 +326,10 @@ function physSettlesState(card) {
     if (ref.physics_settles === false) return 'none';
     return null;
   }
-  // Both modes
-  const vals = Object.values(p).map(m => m.physics_settles);
+  // Both modes — only consider modes that have valid (non-error) data
+  const vals = Object.values(p)
+    .filter(m => !m.error && m.physics_settles !== null && m.physics_settles !== undefined)
+    .map(m => m.physics_settles);
   if (!vals.length) return null;
   const allTrue  = vals.every(v => v === true);
   const allFalse = vals.every(v => v === false);
@@ -356,7 +390,7 @@ function renderCard(card) {
   const cls     = hasErr ? 'has-error' : state === 'both' ? 'settles' : state === 'mixed' ? 'mixed' : 'fails';
 
   const disp = p.displacement_m !== null && p.displacement_m !== undefined
-    ? `<div class="disp">xz_disp: ${p.displacement_m} m &nbsp;|&nbsp; final_y: ${p.final_y_offset_m ?? '–'} m &nbsp;|&nbsp; min_y: ${p.min_y_offset_m ?? '–'} m</div>`
+    ? `<div class="disp">xz_disp: ${p.displacement_m} m &nbsp;|&nbsp; pen_y: ${p.penetration_y_m ?? '–'} m &nbsp;|&nbsp; wall: ${p.wall_time_s != null ? p.wall_time_s + 's' : '–'}</div>`
     : '';
   const err = p.error
     ? `<div class="error-msg">⚠ ${p.error}</div>` : '';
@@ -397,7 +431,7 @@ function applyFilters() {
     if (name    && !c.asset_id.toLowerCase().includes(name))       return false;
     if (settles === 'true'  && physSettlesState(c) !== 'both')   return false;
     if (settles === 'false' && physSettlesState(c) !== 'none')   return false;
-    if (sinks   && String(p.sinks_below_floor) !== sinks)          return false;
+    if (sinks   && String(p.floor_penetration) !== sinks)          return false;
     if (flies   && String(p.flies_away)        !== flies)          return false;
     if (graspF === 'any'     && !(c.grasp_success_rate > 0))       return false;
     if (graspF === 'perfect' && c.grasp_success_rate !== 1.0)      return false;
@@ -414,6 +448,14 @@ function applyFilters() {
       return asc ? a.asset_id.localeCompare(b.asset_id) : b.asset_id.localeCompare(a.asset_id);
     if (sortBy === 'displacement') {
       const va = physRef(a).displacement_m ?? INF, vb = physRef(b).displacement_m ?? INF;
+      return asc ? va - vb : vb - va;
+    }
+    if (sortBy === 'penetration') {
+      const va = physRef(a).penetration_y_m ?? INF, vb = physRef(b).penetration_y_m ?? INF;
+      return asc ? va - vb : vb - va;
+    }
+    if (sortBy === 'walltime') {
+      const va = physRef(a).wall_time_s ?? INF, vb = physRef(b).wall_time_s ?? INF;
       return asc ? va - vb : vb - va;
     }
     if (sortBy === 'contacts') {
@@ -471,19 +513,21 @@ function boolCell(label, val, trueClass, falseClass) {
 function renderPhysicsSection(modes) {
   const sections = Object.entries(modes).map(([mode, m]) => {
     const disp   = m.displacement_m;
-    const minY   = m.min_y_offset_m;
+    const penY   = m.penetration_y_m;
+    const wallT  = m.wall_time_s;
     const dispCls = disp > 0.5 ? 'bad' : disp > 0.1 ? 'warn' : 'ok';
-    const minYCls = minY < -0.05 ? 'bad' : minY < 0 ? 'warn' : 'ok';
-    const finalY    = m.final_y_offset_m;
-    const finalYCls = finalY < -0.02 ? 'bad' : finalY < 0 ? 'warn' : 'ok';
+    const penYCls = penY < -0.05 ? 'bad' : penY < 0 ? 'warn' : 'ok';
+    const wallCls = wallT > 60 ? 'bad' : wallT > 20 ? 'warn' : 'ok';
     const metrics = [
       boolCell('Settles',              m.physics_settles,   'ok',  'bad'),
-      metricCell('XZ Displacement (m)', disp   !== null ? disp.toFixed(4)   : null, dispCls),
+      boolCell('Stable',               m.physics_stable,    'ok',  'bad'),
+      metricCell('XZ Displacement (m)', disp  !== null && disp  !== undefined ? disp.toFixed(4)  : null, dispCls),
       boolCell('Flies away',           m.flies_away,        'bad', 'ok'),
-      metricCell('Final Y offset (m)', finalY !== null ? finalY.toFixed(4) : null, finalYCls),
-      boolCell('Sinks permanently',    m.sinks_permanently, 'bad', 'ok'),
-      metricCell('Min Y offset (m)',   minY   !== null ? minY.toFixed(4)   : null, minYCls),
-      boolCell('Sinks below floor',    m.sinks_below_floor, 'bad', 'ok'),
+      metricCell('Penetration Y (m)',  penY  !== null && penY  !== undefined ? penY.toFixed(4)  : null, penYCls),
+      boolCell('Floor penetration',    m.floor_penetration, 'bad', 'ok'),
+      metricCell('Settle time (s)',    m.settle_time_s !== null && m.settle_time_s !== undefined ? m.settle_time_s.toFixed(3) : null, 'ok'),
+      metricCell('Wall time (s)',      wallT !== null && wallT !== undefined ? wallT.toFixed(1) : null, wallCls),
+      metricCell('Contact points',     m.contact_points_at_rest, ''),
     ].join('');
     const err = m.error ? `<div class="modal-error">⚠ ${m.error}</div>` : '';
     const label = modeLabel(mode);

@@ -31,17 +31,30 @@ FIELDNAMES = [
     "error",
 ]
 
-_sim            = None
-_robot          = None
-_ik_solver      = None
-_modes          = None
-_images_dirs    = None
-_config_dir     = None
-_timeout_s      = None
+FIELDNAMES_SNAP = [
+    "asset_id",
+    "collision_mode",
+    "grasp_success_rate",
+    "grasp_successes",
+    "grasp_trials",
+    "mean_grasp_width_m",
+    "snap_rate",
+    "mean_ee_dist_m",
+    "error",
+]
+
+_sim             = None
+_robot           = None
+_ik_solver       = None
+_modes           = None
+_images_dirs     = None
+_config_dir      = None
+_timeout_s       = None
 _save_all_trials = None
+_use_snap        = None
 
 
-def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s, save_all_trials=False):
+def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s, save_all_trials=False, use_snap=False):
     os.environ["MAGNUM_LOG"] = "quiet"
     os.environ["MAGNUM_GPU_VALIDATION"] = "off"
     os.environ["HABITAT_SIM_LOG"] = "quiet"
@@ -51,11 +64,12 @@ def _worker_init(config_dir, scene_path, save_images, modes, out_dir, timeout_s,
     sys.stderr = devnull
     os.dup2(devnull.fileno(), 2)
 
-    global _sim, _robot, _ik_solver, _modes, _images_dirs, _config_dir, _timeout_s, _save_all_trials
+    global _sim, _robot, _ik_solver, _modes, _images_dirs, _config_dir, _timeout_s, _save_all_trials, _use_snap
     _modes           = modes
     _config_dir      = config_dir
     _timeout_s       = timeout_s
     _save_all_trials = save_all_trials
+    _use_snap        = use_snap
     need_renderer = save_images or save_all_trials
     _sim        = make_sim(scene_path=scene_path, with_renderer=need_renderer, simple_floor=True)
     _robot      = load_fetch_robot(_sim)
@@ -87,11 +101,17 @@ def _process_asset(asset_id):
             })
         return rows
     for mode in _modes:
-        result = graspability_check.run(
-            _sim, _robot, _ik_solver, handles[0], collision_mode=mode,
-            save_dir=_images_dirs[mode], asset_id=asset_id,
-            save_all_trials=_save_all_trials,
-        )
+        if _use_snap:
+            result = graspability_check.run_snap(
+                _sim, _robot, _ik_solver, handles[0], collision_mode=mode,
+                save_dir=_images_dirs[mode], asset_id=asset_id,
+            )
+        else:
+            result = graspability_check.run(
+                _sim, _robot, _ik_solver, handles[0], collision_mode=mode,
+                save_dir=_images_dirs[mode], asset_id=asset_id,
+                save_all_trials=_save_all_trials,
+            )
         rows.append({"asset_id": asset_id, **result})
     return rows
 
@@ -173,6 +193,8 @@ def main():
     parser.add_argument("--save-all-trials", action="store_true",
                         help="Save GIFs for all trials to trials_debug/<asset_id>/")
     parser.add_argument("--resume",         action="store_true")
+    parser.add_argument("--snap",           action="store_true",
+                        help="Use snap-based (suction-cup) grasping instead of physics gripper")
     parser.add_argument("--manifest",       type=Path, default=None,
                         help="filtered_manifest.parquet — used to filter by max_dim ≤ GRASP_MAX_DIM")
     parser.add_argument("--max-dim",        type=float, default=GRASP_MAX_DIM,
@@ -222,20 +244,22 @@ def main():
         print("Nothing to do.")
         return
 
-    print(f"Running graspability check on {len(asset_ids)} assets "
+    method = "snap" if args.snap else "physics"
+    print(f"Running graspability check [{method}] on {len(asset_ids)} assets "
           f"(modes: {modes}, workers: {args.workers}, batch_size: {args.batch_size})...")
 
     init_args = (
         str(args.config_dir), args.scene, args.save_images,
-        modes, str(grasp_dir), args.timeout, args.save_all_trials,
+        modes, str(grasp_dir), args.timeout, args.save_all_trials, args.snap,
     )
 
-    open_mode = "a" if args.resume else "w"
-    batches   = [asset_ids[i:i + args.batch_size]
-                 for i in range(0, len(asset_ids), args.batch_size)]
+    fieldnames = FIELDNAMES_SNAP if args.snap else FIELDNAMES
+    open_mode  = "a" if args.resume else "w"
+    batches    = [asset_ids[i:i + args.batch_size]
+                  for i in range(0, len(asset_ids), args.batch_size)]
 
     with open(csv_path, open_mode, newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if write_header:
             writer.writeheader()
 
@@ -257,6 +281,9 @@ def main():
         mean_rate = m["grasp_success_rate"].mean()
         print(f"\n[{mode}]  any success: {success}/{len(m)}  "
               f"perfect: {perfect}  mean rate: {mean_rate:.3f}")
+        if args.snap and "snap_rate" in m.columns:
+            print(f"  snap rate: {m['snap_rate'].mean():.3f}  "
+                  f"mean EE dist: {m['mean_ee_dist_m'].mean():.3f} m")
         print(f"  errors: {m['error'].notna().sum()}")
 
     print(f"\nFull results: {csv_path}")
